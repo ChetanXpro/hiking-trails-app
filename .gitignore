@@ -1,0 +1,45 @@
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Local environment
+.env
+.env.local
+.env.*.local
+
+# Rust build output
+/target/
+
+# Frontend build/dev artifacts
+/web/node_modules/
+/web/.svelte-kit/
+/web/build/
+/web/dist/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local databases / temp files
+*.sqlite
+*.sqlite3
+*.db
+*.tmp
+*.temp
+
+# Large geodata and import artifacts
+*.osm.pbf
+*.osm.bz2
+*.o5m
+*.mbtiles
+*.gpkg
+*.geojson
+*.gpx
+
+# Keep the folder, ignore downloaded/generated contents by default
+/data/*
+!/data/.gitkeep

@@ -1,0 +1,18 @@
+[package]
+name = "hiking-db"
+version = "0.1.0"
+edition = "2021"
+
+# Note: check crates.io for the latest compatible versions before
+# building -- these are known-good major versions but patch/minor
+# versions move fast in the Rust ecosystem.
+[dependencies]
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+geo-types = "0.7"
+wkb = "0.7"
