@@ -941,6 +941,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wkb",
 ]
 
 [[package]]

@@ -22,11 +22,16 @@ services:
       - "3000:3000"
     env_file:
       - .env
-    environment:
-      # Martin's own DATABASE_URL needs `db` (the compose service name)
-      # as the host, not `localhost` -- that's only correct from your
-      # native processes talking in from outside the compose network.
-      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-hiking}
+    volumes:
+      # Local MBTiles/PMTiles files for Martin autodiscovery, including terrain_rgb.mbtiles.
+      - ./data:/data
+    command:
+      # Martin only loads file-backed sources when the directory/file path
+      # is passed as a startup connection argument.
+      - /data
+      # Keep PostGIS as an explicit startup connection too, instead of
+      # relying on implicit env-based discovery.
+      - postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-hiking}
 
   # Kafka, Redis, or anything else purely infra goes here later --
   # same pattern: image + env_file: .env + a volume if it's stateful.

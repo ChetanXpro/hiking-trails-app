@@ -27,6 +27,7 @@ local raw_relations = osm2pgsql.define_relation_table('raw_relations', {
     { column = 'osm_id',     type = 'bigint', not_null = true },
     { column = 'tags',       type = 'jsonb', not_null = true },
     { column = 'member_ids', type = 'jsonb', not_null = true },
+    { column = 'members',    type = 'jsonb', not_null = true },
 })
 
 -- Waypoints: huts, springs, campsites, peaks -- these come from OSM
@@ -66,16 +67,13 @@ function osm2pgsql.process_node(object)
     end
 end
 
--- Tags we care about for path/track geometry.
-local TRAIL_HIGHWAY_TYPES = {
-    path = true,
-    footway = true,
-    track = true,
-    residential = true,
-}
-
 function osm2pgsql.process_way(object)
-    if object.tags.highway and TRAIL_HIGHWAY_TYPES[object.tags.highway] then
+    -- Keep the raw staging layer broad: hiking relations often include
+    -- ordinary road segments, steps, bridges, and other `highway=*`
+    -- members in addition to classic `path`/`track` ways. If we prune
+    -- too early here, the stitcher never even sees those relation
+    -- members and the final route becomes artificially shorter.
+    if object.tags.highway then
         raw_ways:insert({
             osm_id = object.id,
             tags = object.tags,
@@ -87,7 +85,14 @@ end
 function osm2pgsql.process_relation(object)
     if object.tags.route == 'hiking' then
         local member_ids = {}
+        local members = {}
         for _, member in ipairs(object.members) do
+            table.insert(members, {
+                type = member.type,
+                ref = member.ref,
+                role = member.role or '',
+            })
+
             if member.type == 'w' then
                 table.insert(member_ids, member.ref)
             end
@@ -98,6 +103,7 @@ function osm2pgsql.process_relation(object)
                 osm_id = object.id,
                 tags = object.tags,
                 member_ids = member_ids,
+                members = members,
             })
         end
     end

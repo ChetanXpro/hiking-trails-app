@@ -44,6 +44,12 @@ pub struct Trail {
     pub distance_m: Option<f64>,
     pub ascent_m: Option<f64>,
     pub descent_m: Option<f64>,
+    pub summary: Option<String>,
+    pub hike_type: Option<String>,
+    pub estimated_duration_min: Option<i32>,
+    pub default_direction_mode: String,
+    pub direction_source: Option<String>,
+    pub source_kind: String,
     pub last_synced_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -70,6 +76,21 @@ pub struct Waypoint {
     pub kind: String,
     pub name: Option<String>,
     pub elevation_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct TrailSurfaceBreakdown {
+    pub trail_id: Uuid,
+    pub surface_type: String,
+    pub distance_m: f64,
+    pub pct: f64,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct TrailFeature {
+    pub trail_id: Uuid,
+    pub feature_slug: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +129,9 @@ pub async fn fetch_trail_with_geometry(
     let row = sqlx::query(
         r#"
         SELECT id, osm_relation_id, region_id, name, network, difficulty,
-               distance_m, ascent_m, descent_m, last_synced_at,
+               distance_m, ascent_m, descent_m, summary, hike_type,
+               estimated_duration_min, default_direction_mode, direction_source,
+               source_kind, last_synced_at,
                created_at, updated_at,
                ST_AsBinary(geom) AS geom_wkb
         FROM trails
@@ -129,6 +152,12 @@ pub async fn fetch_trail_with_geometry(
         distance_m: row.try_get("distance_m")?,
         ascent_m: row.try_get("ascent_m")?,
         descent_m: row.try_get("descent_m")?,
+        summary: row.try_get("summary")?,
+        hike_type: row.try_get("hike_type")?,
+        estimated_duration_min: row.try_get("estimated_duration_min")?,
+        default_direction_mode: row.try_get("default_direction_mode")?,
+        direction_source: row.try_get("direction_source")?,
+        source_kind: row.try_get("source_kind")?,
         last_synced_at: row.try_get("last_synced_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
