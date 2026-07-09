@@ -19,6 +19,7 @@
     "vite": "^5.1.0"
   },
   "dependencies": {
+    "maplibre-contour": "^0.1.0",
     "maplibre-gl": "^4.1.0"
   }
 }
