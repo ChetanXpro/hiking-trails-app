@@ -1,8 +1,12 @@
+
 # Hiking trails app
 
 A from-scratch hiking trail platform built on free OpenStreetMap data,
 scoped to Himachal Pradesh first but designed to scale to all of India
 or the world without schema changes.
+
+<img width="1512" height="861" alt="Screenshot 2026-07-13 at 1 54 20 PM" src="https://github.com/user-attachments/assets/ec8f2626-5eb2-41eb-b36f-c386fda3f61d" />
+<img width="1509" height="810" alt="Screenshot 2026-07-12 at 11 47 17 AM" src="https://github.com/user-attachments/assets/4298d9a6-0506-4982-bb43-d7be3a257006" />
 
 ## Layout
 
