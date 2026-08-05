@@ -244,17 +244,5 @@ Open the new `Terrain` control in the top-right of the map to toggle:
 - contour units (meters / feet)
 - terrain exaggeration
 
-Notes:
 
-- Contours are generated in-browser from Terrain-RGB via
-  `maplibre-contour`, so there is no separate contour-tiling pipeline.
-- The currently installed `maplibre-gl` version in this repo supports
-  hillshade + raster-dem terrain, but not `color-relief` layers yet, so
-  elevation tinting is intentionally left disabled for now instead of
-  half-working.
 
-## What's deliberately not here yet
-
-- User accounts / community content -- out of scope for now
-- SOI licensed data -- phase 2, pending the licensing/entity-type
-  question flagged earlier
