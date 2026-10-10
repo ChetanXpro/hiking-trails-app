@@ -1,10 +1,18 @@
 mod cautions;
 mod config;
+mod database;
+mod manifest;
+mod places;
+mod schema;
 mod stitch;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use config::{env_bool, env_f64, env_usize, non_blank_path, find_tif_files, detect_gdal_capabilities, GdalCapabilities};
+use database::*;
+use manifest::*;
+use places::*;
+use schema::*;
 use hiking_db::decode_wkb;
 use serde::Deserialize;
 use serde_json::Value;
