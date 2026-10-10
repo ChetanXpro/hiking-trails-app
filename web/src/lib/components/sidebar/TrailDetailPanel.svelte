@@ -2,18 +2,6 @@
 	import type { TrailDetail, TrailSurface, TrailWaypoint, WeatherForecast } from '../../types';
 	import ElevationChart from '../../ElevationChart.svelte';
 	import WeatherSummary from '../../WeatherSummary.svelte';
-	import {
-		difficultyLabel,
-		hikeTypeLabel,
-		formatDistance,
-		formatElevation,
-		formatDuration,
-		featureLabel,
-		surfaceLabel,
-		surfaceColor,
-		directionLabel,
-		normalizeExternalUrl
-	} from '../../format';
 
 	interface Props {
 		selectedTrail: TrailDetail | null;
@@ -28,6 +16,13 @@
 		weatherStatus: 'loading' | 'ready' | 'error';
 		weatherError: string | null;
 		qaMode?: boolean;
+		// Pre-formatted display strings from parent
+		difficultyLabel?: string;
+		hikeTypeLabel?: string;
+		distanceLabel?: string;
+		ascentLabel?: string;
+		descentLabel?: string;
+		durationLabel?: string;
 		onClose?: () => void;
 		onCenter?: () => void;
 		onShare?: () => void;
@@ -72,7 +67,7 @@
 
 		<div class="hero">
 			<p class="eyebrow">
-				{difficultyLabel(selectedTrail.difficulty)} · {hikeTypeLabel(selectedTrail.hike_type)}
+				{difficultyLabel} · {hikeTypeLabel}
 			</p>
 			<h2>{selectedTrail.name ?? 'Unnamed trail'}</h2>
 			{#if selectedTrail.summary}
@@ -83,23 +78,19 @@
 		<div class="stats">
 			<div>
 				<span>Length</span>
-				<strong>{formatDistance(selectedTrail.distance_m)}</strong>
+				<strong>{distanceLabel}</strong>
 			</div>
 			<div>
 				<span>Ascent</span>
-				<strong>{formatElevation(selectedTrail.ascent_m)}</strong>
+				<strong>{ascentLabel}</strong>
 			</div>
 			<div>
 				<span>Descent</span>
-				<strong>{formatElevation(selectedTrail.descent_m)}</strong>
+				<strong>{descentLabel}</strong>
 			</div>
 			<div>
 				<span>Est. time</span>
-				<strong title={formatDuration(selectedTrail.estimated_duration_min)}>
-					{formatDuration(selectedTrail.estimated_duration_min)
-						.replaceAll(' hr', 'h')
-						.replaceAll(' min', 'm')}
-				</strong>
+				<strong>{durationLabel}</strong>
 			</div>
 		</div>
 
@@ -187,9 +178,9 @@
 							onclick={() => onShowWaypoint?.(waypoint)}
 						>
 							<span>
-								<strong>{waypoint.name ?? surfaceLabel(waypoint.kind)}</strong>
+								<strong>{waypoint.name ?? waypoint.kind}</strong>
 								<small>
-									{surfaceLabel(waypoint.kind)}{waypoint.elevation_m != null
+									{waypoint.kind}{waypoint.elevation_m != null
 										? ` · ${Math.round(waypoint.elevation_m)} m`
 										: ''}
 								</small>
@@ -218,7 +209,7 @@
 				<h3>What to expect</h3>
 				<div class="chips">
 					{#each selectedTrail.features as feature}
-						<span class="chip">{featureLabel(feature)}</span>
+						<span class="chip">{feature}</span>
 					{/each}
 				</div>
 			</section>
@@ -229,19 +220,16 @@
 				<h3>Surfaces</h3>
 				<div class="surface-bar">
 					{#each selectedTrail.surfaces as surface}
-						<div
-							class="surface-segment"
-							style={`width:${surface.pct}%;background:${surfaceColor(surface.surface_type)}`}
-						></div>
+						<div class="surface-segment" style={`width:${surface.pct}%;background: #888`}></div>
 					{/each}
 				</div>
 				<div class="surface-list">
 					{#each selectedTrail.surfaces as surface}
 						<div class="surface-item">
-							<span class="dot" style={`background:${surfaceColor(surface.surface_type)}`}></span>
+							<span class="dot" style="background: #888"></span>
 							<div>
-								<strong>{surfaceLabel(surface.surface_type)}</strong>
-								<p>{surface.pct.toFixed(0)}% · {formatDistance(surface.distance_m)}</p>
+								<strong>{surface.surface_type}</strong>
+								<p>{surface.pct.toFixed(0)}%</p>
 							</div>
 						</div>
 					{/each}

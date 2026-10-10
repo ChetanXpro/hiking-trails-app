@@ -1,9 +1,12 @@
 	<script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
+	import { pushState, replaceState } from '$app/navigation';
+	import { env } from '$env/dynamic/public';
 	import maplibregl from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
 	import {
 		absolutizeBasemapStyleResources,
+		buildOsmDerivedVectorSource,
 		findFirstLabelAnchor,
 		normalizeBasemapStyleUrl,
 		prepareOutdoorBasemapStyle,
@@ -13,6 +16,12 @@
 		type MutableBasemapStyle
 	} from './basemap-config';
 	import WeatherSummary from './WeatherSummary.svelte';
+	import TrailDiscovery from './TrailDiscovery.svelte';
+	import ElevationChart from './ElevationChart.svelte';
+	import { readMapState, writeMapState, viewportBounds } from './map-state';
+	import { buildRouteIndex } from './profile-index';
+	let { qaMode = false }: { qaMode?: boolean } = $props();
+	import { installAppOutdoorPoiImages } from './outdoor-poi-icons';
 	import { OUTDOOR_THEME } from './outdoor-theme';
 	import {
 		buildCustomPoiFilter,
@@ -35,16 +44,20 @@
 	} from './peak-config';
 	import {
 		DEFAULT_TERRAIN_ATTRIBUTION,
+		contourIntervalsAtZoom,
 		DEFAULT_TERRAIN_BOUNDS,
 		DEFAULT_TERRAIN_RGB_URL,
-		normalizeTerrainBounds
+		normalizeTerrainBounds,
+		normalizeTerrainMaxZoom
 	} from './terrain-config';
 	import { SLOPE_BANDS, SLOPE_CLEAR_BELOW, SLOPE_PLANNING_NOTE } from './slope-config';
 	import {
+		DEFAULT_WEATHER_API_URL,
 		fetchWeatherForecast,
 		type LngLatTuple,
 		type WeatherForecast
 	} from './weather';
+	import { isAbortError, requestBlob, requestJson } from './request';
 	import {
 		dedupeMapSelections,
 		markedLocationSelection,
@@ -61,39 +74,84 @@
 		setContoursVisible,
 		setHillshadeVisible,
 		setSlopeOpacity,
-		setSlopeVisible,
-		setTerrainExaggeration
+		setSlopeVisible
 	} from './terrain-layers';
+	import { TerrainControls, LayersPanel } from './components/controls';
+	import { TrailDetailPanel } from './components/sidebar';
+	import { MapControls, Map3DView } from './components/map';
 
 	const INITIAL_CENTER: [number, number] = [77.18, 32.24];
 	const INITIAL_ZOOM = 9;
-	const BASEMAP_STYLE_URL = normalizeBasemapStyleUrl(import.meta.env.VITE_BASEMAP_STYLE_URL);
-	const BASEMAP_LABEL_ANCHOR_ID = import.meta.env.VITE_BASEMAP_LABEL_ANCHOR_ID?.trim() || undefined;
-	const CUSTOM_GLYPHS_URL = import.meta.env.VITE_MAP_GLYPHS_URL?.trim() || undefined;
+	function publicSetting(name: `PUBLIC_${string}`, legacyValue?: string) {
+		return env[name]?.trim() || legacyValue?.trim() || undefined;
+	}
+
+	const CONFIGURED_BASEMAP_STYLE_URL = publicSetting(
+		'PUBLIC_BASEMAP_STYLE_URL',
+		import.meta.env.VITE_BASEMAP_STYLE_URL
+	);
+	const BASEMAP_STYLE_URL = CONFIGURED_BASEMAP_STYLE_URL
+		? normalizeBasemapStyleUrl(CONFIGURED_BASEMAP_STYLE_URL)
+		: import.meta.env.DEV
+			? normalizeBasemapStyleUrl(undefined)
+			: null;
+	const BASEMAP_LABEL_ANCHOR_ID = publicSetting(
+		'PUBLIC_BASEMAP_LABEL_ANCHOR_ID',
+		import.meta.env.VITE_BASEMAP_LABEL_ANCHOR_ID
+	);
+	const CUSTOM_GLYPHS_URL = publicSetting(
+		'PUBLIC_MAP_GLYPHS_URL',
+		import.meta.env.VITE_MAP_GLYPHS_URL
+	);
 	const GLYPHS_URL =
-		CUSTOM_GLYPHS_URL ?? 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf';
+		CUSTOM_GLYPHS_URL ??
+		(import.meta.env.DEV
+			? 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf'
+			: undefined);
+	const RASTER_TILE_URL_TEMPLATE =
+		publicSetting('PUBLIC_RASTER_TILE_URL', import.meta.env.VITE_RASTER_TILE_URL) ??
+		(import.meta.env.DEV ? 'https://tile.openstreetmap.org/{z}/{x}/{y}.png' : undefined);
+	const RASTER_TILE_ATTRIBUTION =
+		publicSetting(
+			'PUBLIC_RASTER_TILE_ATTRIBUTION',
+			import.meta.env.VITE_RASTER_TILE_ATTRIBUTION
+		) ?? (import.meta.env.DEV ? '&copy; OpenStreetMap contributors' : undefined);
+	const WEATHER_API_URL =
+		publicSetting('PUBLIC_WEATHER_API_URL', import.meta.env.VITE_WEATHER_API_URL) ??
+		(import.meta.env.DEV ? DEFAULT_WEATHER_API_URL : undefined);
 	const MARTIN_TRAILS_URL_TEMPLATE =
-		import.meta.env.VITE_MARTIN_TRAILS_URL ?? '/trail_lines/{z}/{x}/{y}';
+		publicSetting('PUBLIC_MARTIN_TRAILS_URL', import.meta.env.VITE_MARTIN_TRAILS_URL) ??
+		'/trail_lines/{z}/{x}/{y}';
 	const MARTIN_OUTDOOR_WAYPOINTS_URL_TEMPLATE =
-		import.meta.env.VITE_MARTIN_OUTDOOR_WAYPOINTS_URL ?? '/outdoor_waypoints/{z}/{x}/{y}';
+		publicSetting(
+			'PUBLIC_MARTIN_OUTDOOR_WAYPOINTS_URL',
+			import.meta.env.VITE_MARTIN_OUTDOOR_WAYPOINTS_URL
+		) ?? '/outdoor_waypoints/{z}/{x}/{y}';
 	const TERRAIN_RGB_URL_TEMPLATE =
-		import.meta.env.VITE_TERRAIN_RGB_URL ?? DEFAULT_TERRAIN_RGB_URL;
+		publicSetting('PUBLIC_TERRAIN_RGB_URL', import.meta.env.VITE_TERRAIN_RGB_URL) ??
+		DEFAULT_TERRAIN_RGB_URL;
 	const TERRAIN_RGB_ENCODING =
-		import.meta.env.VITE_TERRAIN_RGB_ENCODING?.trim().toLowerCase() === 'terrarium'
+		publicSetting('PUBLIC_TERRAIN_RGB_ENCODING', import.meta.env.VITE_TERRAIN_RGB_ENCODING)?.toLowerCase() === 'terrarium'
 			? 'terrarium'
 			: 'mapbox';
 	const TERRAIN_RGB_TILE_SIZE =
-		Number.parseInt(import.meta.env.VITE_TERRAIN_RGB_TILE_SIZE ?? '512', 10) === 256 ? 256 : 512;
-	const TERRAIN_RGB_MAX_ZOOM = Number.parseInt(
-		import.meta.env.VITE_TERRAIN_RGB_MAX_ZOOM ?? '13',
-		10
+		Number.parseInt(
+			publicSetting('PUBLIC_TERRAIN_RGB_TILE_SIZE', import.meta.env.VITE_TERRAIN_RGB_TILE_SIZE) ??
+				'512',
+			10
+		) === 256
+			? 256
+			: 512;
+	const TERRAIN_RGB_MAX_ZOOM = normalizeTerrainMaxZoom(
+		publicSetting('PUBLIC_TERRAIN_RGB_MAX_ZOOM', import.meta.env.VITE_TERRAIN_RGB_MAX_ZOOM) ??
+			'13'
 	);
 	const TERRAIN_RGB_BOUNDS = normalizeTerrainBounds(
-		import.meta.env.VITE_TERRAIN_RGB_BOUNDS,
+		publicSetting('PUBLIC_TERRAIN_RGB_BOUNDS', import.meta.env.VITE_TERRAIN_RGB_BOUNDS),
 		TERRAIN_RGB_URL_TEMPLATE === DEFAULT_TERRAIN_RGB_URL ? DEFAULT_TERRAIN_BOUNDS : undefined
 	);
 	const TERRAIN_ATTRIBUTION =
-		import.meta.env.VITE_TERRAIN_ATTRIBUTION?.trim() ||
+		publicSetting('PUBLIC_TERRAIN_ATTRIBUTION', import.meta.env.VITE_TERRAIN_ATTRIBUTION) ||
 		(TERRAIN_RGB_URL_TEMPLATE === DEFAULT_TERRAIN_RGB_URL
 			? DEFAULT_TERRAIN_ATTRIBUTION
 			: undefined);
@@ -130,6 +188,8 @@
 	const SELECTED_TRAIL_ARROW_IMAGE = 'selected-trail-direction-chevron';
 	const SELECTED_TRAIL_MARKER_LAYER = 'selected-trail-markers';
 	const SELECTED_TRAIL_MARKER_LABEL_LAYER = 'selected-trail-marker-labels';
+	const SELECTED_TRAIL_CURSOR_SOURCE = 'selected-trail-profile-cursor';
+	const SELECTED_TRAIL_CURSOR_LAYER = 'selected-trail-profile-cursor-point';
 	const SELECTED_MAP_FEATURE_SOURCE = 'selected-map-feature';
 	const SELECTED_MAP_FEATURE_GLOW_LAYER = 'selected-map-feature-glow';
 	const SELECTED_MAP_FEATURE_LAYER = 'selected-map-feature-point';
@@ -139,7 +199,7 @@
 	type TrailGeometry = {
 		type: string;
 		coordinates?: unknown;
-		geometries?: unknown[];
+		geometries?: TrailGeometry[];
 	};
 
 	type PointGeometry = {
@@ -234,6 +294,10 @@
 
 	type TrailDetail = {
 		id: string;
+		osm_relation_id: number;
+		data_revision: string | null;
+		last_synced_at: string | null;
+		cautions?: Array<{kind: string; message: string; source_url: string}>;
 		name: string | null;
 		network: string | null;
 		difficulty: string | null;
@@ -270,6 +334,8 @@
 		}>;
 		features: string[];
 		waypoints: Array<{
+			longitude: number | null;
+			latitude: number | null;
 			kind: string;
 			name: string | null;
 			elevation_m: number | null;
@@ -282,6 +348,7 @@
 	let searchInput: HTMLInputElement | undefined;
 	let map: maplibregl.Map | undefined;
 	let scaleControl: maplibregl.ScaleControl | undefined;
+	let waypointMarker: maplibregl.Marker | undefined;
 	let selectedTrail: TrailDetail | null = $state(null);
 	let selectedMapFeature: MapFeatureSelection | null = $state(null);
 	let nearbyMapFeatures: MapFeatureSelection[] = $state([]);
@@ -296,7 +363,11 @@
 	let downloadSectionOpen = $state(false);
 	let downloadBusy = $state(false);
 	let downloadError: string | null = $state(null);
+	let downloadAbortController: AbortController | null = null;
+	let downloadRequestVersion = 0;
 	let trailRequestVersion = 0;
+	let trailDetailAbortController: AbortController | null = null;
+	let elevationAbortController: AbortController | null = null;
 	let routeChoices: RouteChoice[] = $state([]);
 	let routeChooserPosition: { x: number; y: number } | null = $state(null);
 	let hoveredRouteChoiceId: string | null = $state(null);
@@ -342,22 +413,90 @@
 	let searchError: string | null = $state(null);
 	let activeSearchIndex = $state(-1);
 	let searchRequestVersion = 0;
+	let searchAbortController: AbortController | null = null;
 	let searchDebounceHandle: ReturnType<typeof setTimeout> | null = null;
 	let mapLabelAnchorId: string | undefined;
 	let mapTerrainAnchorId: string | undefined;
 	let mapRevealHandle: ReturnType<typeof setTimeout> | null = null;
 	let componentDestroyed = false;
+	const reportedMapErrors = new Set<string>();
 	let detailPanelOpen = $derived(Boolean(selectedTrail || selectedMapFeature || detailError));
 
-	const SEARCH_MIN_CHARS = 2;
+	let discoveryBounds: [number, number, number, number] | null = $state(null);
+	let mapZoom = $state(INITIAL_ZOOM);
+	let shareMessage = $state('');
+	let shareFallback = $state('');
+	let restoringLocation = false;
+	let restorationVersion = 0;
+	let navigationTrailId: string | null = null;
+	const routeIndex = $derived.by(() => selectedTrail?.geometry ? buildRouteIndex(selectedTrail.geometry, coordinateDistanceM) : null);
+	const incompleteRoute = $derived.by(() => selectedTrail?.stitch_warnings.some(w => ['disconnected_pieces', 'stranded_segments', 'missing_members'].includes(w.kind)) ?? false);
+	const contourInterval = $derived(contourIntervalsAtZoom(terrainContourUnit, mapZoom));
+
+	function showWaypoint(waypoint: TrailDetail['waypoints'][number]) {
+		if (!map || waypoint.longitude == null || waypoint.latitude == null) return;
+		const center: [number, number] = [waypoint.longitude, waypoint.latitude];
+		waypointMarker?.remove();
+		waypointMarker = new maplibregl.Marker({ color: '#d3a642' }).setLngLat(center).addTo(map);
+		map.fitBounds([center, center], { maxZoom: Math.max(14, map.getZoom()), duration: 500,
+			padding: window.innerWidth < 740 ? { top: 50, bottom: window.innerHeight * .6, left: 20, right: 20 } : { top: 70, bottom: 40, left: 500, right: 80 } });
+	}
+
+	function currentView() {
+		return map ? { center: [map.getCenter().lng, map.getCenter().lat] as [number, number], zoom: map.getZoom() } : null;
+	}
+	function persistLocation(push = false) {
+		if (restoringLocation || !map) return;
+		const url = writeMapState(new URL(window.location.href), navigationTrailId, currentView());
+		if (url.href !== window.location.href) (push ? pushState : replaceState)(url, {});
+	}
+	function updateViewport() {
+		if (!map) return;
+		const b = map.getBounds();
+		discoveryBounds = viewportBounds(b.getWest(), b.getSouth(), b.getEast(), b.getNorth()).map(v => Number(v.toFixed(5))) as [number, number, number, number];
+		mapZoom = map.getZoom();
+		persistLocation();
+	}
+	async function restoreLocation() {
+		const version = ++restorationVersion;
+		const state = readMapState(new URL(window.location.href));
+		restoringLocation = true;
+		try {
+			navigationTrailId = state.trail;
+			if (state.view) map?.jumpTo({ ...state.view, padding: { top: 0, bottom: 0, left: 0, right: 0 } });
+			if (state.trail) await loadTrail(state.trail, false, !state.view);
+			else closePanel();
+		} finally { if (version === restorationVersion) restoringLocation = false; }
+	}
+	async function shareTrail() {
+		if (!selectedTrail) return;
+		const url = writeMapState(new URL(window.location.href), selectedTrail.id, currentView()).href;
+		shareMessage = 'Share this hike'; shareFallback = url;
+		try {
+			if (navigator.share) { await navigator.share({ title: selectedTrail.name ?? 'Hiking route', url }); shareMessage = 'Shared'; }
+			else { await navigator.clipboard.writeText(url); shareMessage = 'Link copied'; shareFallback = ''; }
+		} catch (error) {
+			if (error instanceof Error && error.name === 'AbortError') return;
+			shareFallback = url; shareMessage = 'Copy this link to share the hike.';
+		}
+	}
+
+	// PostgreSQL's trigram index needs three characters to avoid turning every
+	// short public search into a full scan as the place catalogue grows.
+	const SEARCH_MIN_CHARS = 3;
 
 	$effect(() => {
 		if (!selectedTrail) return;
 		directionMode;
 		downloadSectionOpen;
+		syncSelectedTrailLayer();
+	});
+
+	$effect(() => {
+		selectedTrail;
 		elevationHoverPosM;
 		elevationHoverEleM;
-		syncSelectedTrailLayer();
+		syncProfileCursorLayer();
 	});
 
 	$effect(() => {
@@ -386,7 +525,6 @@
 		setContourUnit(map, terrainContourUnit);
 		setOutdoorElevationUnit(terrainContourUnit);
 		scaleControl?.setUnit(terrainContourUnit === 'feet' ? 'imperial' : 'metric');
-		setTerrainExaggeration(map, TERRAIN_EXAGGERATION);
 		set3DTerrainEnabled(map, terrain3dEnabled, TERRAIN_EXAGGERATION);
 	});
 
@@ -404,6 +542,7 @@
 	});
 
 	onMount(() => {
+		window.addEventListener('popstate', restoreLocation);
 		void initializeMap().catch((error) => {
 			mapLoadError = error instanceof Error ? error.message : 'The outdoor map could not be prepared.';
 		});
@@ -441,19 +580,22 @@
 			MARTIN_OUTDOOR_WAYPOINTS_URL_TEMPLATE
 		);
 		const terrainRgbUrl = absolutizeTileTemplate(TERRAIN_RGB_URL_TEMPLATE);
+		const initialState = readMapState(new URL(window.location.href));
+		navigationTrailId = initialState.trail;
 		const preparedStyle = await loadPreparedMapStyle();
 		if (componentDestroyed) return;
 
 		map = new maplibregl.Map({
 			container: mapContainer,
 			style: preparedStyle,
-			center: INITIAL_CENTER,
-			zoom: INITIAL_ZOOM,
-			maxPitch: 85,
+			center: initialState.view?.center ?? INITIAL_CENTER,
+			zoom: initialState.view?.zoom ?? INITIAL_ZOOM,
+			maxPitch: 60,
 			centerClampedToGround: true,
 			attributionControl: false,
 			fadeDuration: 100
 		});
+		map.on('error', (event) => handleMapError(event.error));
 
 		map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
 		map.addControl(new maplibregl.FullscreenControl(), 'top-right');
@@ -487,7 +629,7 @@
 				terrainRgbUrl,
 				encoding: TERRAIN_RGB_ENCODING,
 				tileSize: TERRAIN_RGB_TILE_SIZE,
-				maxzoom: Number.isFinite(TERRAIN_RGB_MAX_ZOOM) ? TERRAIN_RGB_MAX_ZOOM : 13,
+				maxzoom: TERRAIN_RGB_MAX_ZOOM,
 				bounds: TERRAIN_RGB_BOUNDS,
 				attribution: TERRAIN_ATTRIBUTION,
 				surfaceAnchorId: mapTerrainAnchorId,
@@ -530,6 +672,8 @@
 				});
 			}
 
+			void restoreLocation();
+			updateViewport();
 			revealMapAfterInitialRender();
 		});
 
@@ -540,7 +684,31 @@
 			if (map) mapBearing = Math.round(map.getBearing());
 		});
 
+		map.on('moveend', updateViewport);
 		map.on('click', (event) => void handleMapClick(event));
+	}
+
+	function handleMapError(error: unknown) {
+		if (componentDestroyed || isAbortError(error)) return;
+		const message =
+			error instanceof Error
+				? error.message
+				: typeof error === 'string'
+					? error
+					: 'Unknown map rendering error';
+		if (!reportedMapErrors.has(message) && reportedMapErrors.size < 5) {
+			reportedMapErrors.add(message);
+			console.warn('MapLibre:', message);
+		}
+
+		// Individual missing tiles are recoverable and should not cover a usable
+		// map. Surface only initialization/rendering failures before first paint.
+		if (
+			!mapVisualReady &&
+			/(style|webgl|failed to initialize|source .* not found|parse)/i.test(message)
+		) {
+			mapLoadError = 'The map could not finish loading its style or renderer. Check the configured map services and try again.';
+		}
 	}
 
 	async function handleMapClick(event: maplibregl.MapMouseEvent) {
@@ -653,12 +821,15 @@
 		nearby: MapFeatureSelection[],
 		nearbyTrails: RouteChoice[]
 	) {
-		trailRequestVersion += 1;
+		abortTrailRequests();
 		mapFeatureElevationAbortController?.abort();
 		const controller = new AbortController();
 		mapFeatureElevationAbortController = controller;
 		const requestVersion = ++mapFeatureRequestVersion;
 		selectedTrail = null;
+		navigationTrailId = null;
+		persistLocation(true);
+		waypointMarker?.remove();
 		detailError = null;
 		clearSelectedTrailLayer();
 		selectedMapFeature = feature;
@@ -830,6 +1001,12 @@
 		force = false
 	) {
 		if (!coordinates) return;
+		if (!WEATHER_API_URL) {
+			weatherForecast = null;
+			weatherStatus = 'error';
+			weatherError = 'Weather service is not configured for this deployment.';
+			return;
+		}
 		weatherAbortController?.abort();
 		weatherAbortController = null;
 		const cacheKey = `${coordinates[0].toFixed(3)},${coordinates[1].toFixed(3)}`;
@@ -845,15 +1022,28 @@
 		weatherStatus = 'loading';
 		weatherError = null;
 		try {
-			const forecast = await fetchWeatherForecast(coordinates, controller.signal);
+			const forecast = await fetchWeatherForecast(
+				coordinates,
+				controller.signal,
+				10_000,
+				WEATHER_API_URL
+			);
 			if (weatherAbortController !== controller) return;
 			weatherForecast = forecast;
+			weatherCache.delete(cacheKey);
 			weatherCache.set(cacheKey, { forecast, expiresAt: Date.now() + 10 * 60 * 1000 });
+			while (weatherCache.size > 24) {
+				const oldestKey = weatherCache.keys().next().value;
+				if (typeof oldestKey !== 'string') break;
+				weatherCache.delete(oldestKey);
+			}
 			weatherStatus = 'ready';
 		} catch (error) {
 			if (controller.signal.aborted || weatherAbortController !== controller) return;
 			weatherStatus = 'error';
 			weatherError = error instanceof Error ? error.message : 'Weather forecast failed';
+		} finally {
+			if (weatherAbortController === controller) weatherAbortController = null;
 		}
 	}
 
@@ -885,15 +1075,25 @@
 	}
 
 	function buildLegacyRasterStyle() {
+		if (!RASTER_TILE_URL_TEMPLATE) {
+			throw new Error(
+				'No production basemap configured. Set PUBLIC_BASEMAP_STYLE_URL or PUBLIC_RASTER_TILE_URL.'
+			);
+		}
+		if (!GLYPHS_URL) {
+			throw new Error(
+				'Raster basemaps require PUBLIC_MAP_GLYPHS_URL for trail, contour, and place labels.'
+			);
+		}
 		return {
 			version: 8,
 			glyphs: GLYPHS_URL,
 			sources: {
 				osm: {
 					type: 'raster',
-					tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+					tiles: [RASTER_TILE_URL_TEMPLATE],
 					tileSize: 256,
-					attribution: '&copy; OpenStreetMap contributors'
+					...(RASTER_TILE_ATTRIBUTION ? { attribution: RASTER_TILE_ATTRIBUTION } : {})
 				}
 			},
 			layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
@@ -906,14 +1106,10 @@
 		labelAnchorId?: string
 	) {
 		if (!map) return;
+		installAppOutdoorPoiImages(map);
 
 		if (!map.getSource('outdoor-waypoints')) {
-			map.addSource('outdoor-waypoints', {
-				type: 'vector',
-				tiles: [outdoorWaypointsUrl],
-				minzoom: 0,
-				maxzoom: 14
-			});
+			map.addSource('outdoor-waypoints', buildOsmDerivedVectorSource(outdoorWaypointsUrl));
 		}
 
 		if (map.getSource('openmaptiles')) {
@@ -954,7 +1150,7 @@
 						'text-line-height': 1.08,
 						'text-max-width': 12,
 						'text-padding': tier.textPadding,
-						'text-pitch-alignment': 'viewport',
+						'text-pitch-alignment': 'map',
 						'text-rotation-alignment': 'viewport',
 						'text-allow-overlap': false,
 						'text-ignore-placement': false,
@@ -1023,7 +1219,7 @@
 					'text-offset': [0, 0.8],
 					'text-max-width': 11,
 					'text-padding': 4,
-					'text-pitch-alignment': 'viewport',
+					'text-pitch-alignment': 'map',
 					'text-rotation-alignment': 'viewport',
 					'text-allow-overlap': false,
 					'text-ignore-placement': false,
@@ -1062,7 +1258,7 @@
 						'text-offset': [0, 0.82],
 						'text-max-width': 11,
 						'text-padding': 4,
-						'text-pitch-alignment': 'viewport',
+						'text-pitch-alignment': 'map',
 						'text-rotation-alignment': 'viewport',
 						'text-allow-overlap': false,
 						'text-ignore-placement': false,
@@ -1144,12 +1340,7 @@
 		if (!map) return;
 
 		if (!map.getSource('trails')) {
-			map.addSource('trails', {
-				type: 'vector',
-				tiles: [trailTilesUrl],
-				minzoom: 0,
-				maxzoom: 14
-			});
+			map.addSource('trails', buildOsmDerivedVectorSource(trailTilesUrl));
 		}
 
 		addKnownRouteLineLayer(
@@ -1353,7 +1544,7 @@
 					'text-letter-spacing': 0.01,
 					'text-max-angle': 30,
 					'text-padding': 6,
-					'text-pitch-alignment': 'viewport',
+					'text-pitch-alignment': 'map',
 					'text-rotation-alignment': 'viewport-glyph',
 					'text-allow-overlap': false,
 					'text-ignore-placement': false
@@ -1615,6 +1806,14 @@
 	function closeSearchPanel() {
 		searchPanelOpen = false;
 		activeSearchIndex = -1;
+		searchLoading = false;
+		searchRequestVersion += 1;
+		if (searchDebounceHandle) {
+			clearTimeout(searchDebounceHandle);
+			searchDebounceHandle = null;
+		}
+		searchAbortController?.abort();
+		searchAbortController = null;
 	}
 
 	function clearSearchResults() {
@@ -1628,7 +1827,6 @@
 
 	function resetSearch() {
 		searchQuery = '';
-		searchRequestVersion += 1;
 		if (searchDebounceHandle) {
 			clearTimeout(searchDebounceHandle);
 			searchDebounceHandle = null;
@@ -1639,20 +1837,25 @@
 	}
 
 	async function runSearch(term: string, requestVersion: number) {
+		const controller = new AbortController();
+		searchAbortController?.abort();
+		searchAbortController = controller;
 		try {
 			const params = new URLSearchParams({
 				q: term.trim(),
 				limit: '10'
 			});
-			const response = await fetch(`/api/search?${params.toString()}`);
+			const response = await requestJson<unknown>(`/api/search?${params.toString()}`, {
+				signal: controller.signal,
+				timeoutMs: 8_000
+			});
 			if (!response.ok) {
 				throw new Error(`Search request failed with ${response.status}`);
 			}
 
-			const payload = await response.json();
 			if (requestVersion !== searchRequestVersion) return;
 
-			const parsed = sanitizeSearchResults(payload);
+			const parsed = sanitizeSearchResults(response.data);
 			searchRoutes = parsed.routes;
 			searchPlaces = parsed.places;
 			searchResults = [...parsed.routes, ...parsed.places];
@@ -1660,6 +1863,7 @@
 			searchError = null;
 			activeSearchIndex = searchResults.length > 0 ? 0 : -1;
 		} catch (error) {
+			if (controller.signal.aborted || isAbortError(error)) return;
 			if (requestVersion !== searchRequestVersion) return;
 			searchRoutes = [];
 			searchPlaces = [];
@@ -1667,6 +1871,8 @@
 			searchLoading = false;
 			searchError = error instanceof Error ? error.message : 'Search failed';
 			activeSearchIndex = -1;
+		} finally {
+			if (searchAbortController === controller) searchAbortController = null;
 		}
 	}
 
@@ -1678,6 +1884,8 @@
 			clearTimeout(searchDebounceHandle);
 			searchDebounceHandle = null;
 		}
+		searchAbortController?.abort();
+		searchAbortController = null;
 
 		if (trimmed.length < SEARCH_MIN_CHARS) {
 			searchRequestVersion += 1;
@@ -1694,6 +1902,7 @@
 		searchError = null;
 		const requestVersion = ++searchRequestVersion;
 		searchDebounceHandle = setTimeout(() => {
+			searchDebounceHandle = null;
 			void runSearch(trimmed, requestVersion);
 		}, 150);
 	}
@@ -1714,6 +1923,7 @@
 	function fitToSearchBounds(bbox: [number, number, number, number]) {
 		if (!map) return;
 		const [minLon, minLat, maxLon, maxLat] = bbox;
+		const mobile = window.innerWidth < 740;
 		map.fitBounds(
 			[
 				[minLon, minLat],
@@ -1722,9 +1932,9 @@
 			{
 				padding: {
 					top: 96,
-					right: window.innerWidth < 740 ? 24 : activeMapPanel ? 440 : 80,
+					right: mobile ? 24 : activeMapPanel ? 440 : 80,
 					bottom: 80,
-					left: detailPanelOpen ? 460 : 80
+					left: mobile ? 24 : detailPanelOpen ? 460 : 80
 				},
 				duration: 850
 			}
@@ -1796,32 +2006,70 @@
 		}
 	}
 
+	function abortTrailRequests() {
+		trailRequestVersion += 1;
+		trailDetailAbortController?.abort();
+		trailDetailAbortController = null;
+		elevationAbortController?.abort();
+		elevationAbortController = null;
+		abortDownloadRequest();
+	}
+
+	function abortDownloadRequest() {
+		downloadRequestVersion += 1;
+		downloadAbortController?.abort();
+		downloadAbortController = null;
+		downloadBusy = false;
+	}
+
 	onDestroy(() => {
 		componentDestroyed = true;
+		if (typeof window !== 'undefined') window.removeEventListener('popstate', restoreLocation);
 		if (searchDebounceHandle) {
 			clearTimeout(searchDebounceHandle);
 		}
 		if (mapRevealHandle) {
 			clearTimeout(mapRevealHandle);
 		}
+		searchAbortController?.abort();
+		abortTrailRequests();
 		weatherAbortController?.abort();
 		mapFeatureElevationAbortController?.abort();
+		waypointMarker?.remove();
 		map?.remove();
 	});
 
-	async function loadTrail(trailId: string) {
-		const requestVersion = ++trailRequestVersion;
+	async function loadTrail(trailId: string, updateHistory = true, fit = true) {
+		waypointMarker?.remove();
+		shareMessage = ''; shareFallback = '';
+		searchPanelOpen = false;
+		abortTrailRequests();
+		const requestVersion = trailRequestVersion;
+		const controller = new AbortController();
+		trailDetailAbortController = controller;
 		detailError = null;
 		clearSelectedMapFeatureLayer();
+		weatherAbortController?.abort();
+		weatherAbortController = null;
+		weatherForecast = null;
+		weatherStatus = 'idle';
+		weatherError = null;
 
 		try {
 			clearRouteChoices();
-			const response = await fetch(`/api/trails/${trailId}`);
+			const response = await requestJson<TrailDetail>(`/api/trails/${trailId}?v=2`, {
+				cache: 'no-cache',
+				signal: controller.signal,
+				timeoutMs: 12_000
+			});
 			if (!response.ok) {
 				throw new Error(`Trail request failed with ${response.status}`);
 			}
 
-			const payload = await response.json();
+			const payload = response.data;
+			if (!payload || typeof payload !== 'object') {
+				throw new Error('Trail service returned invalid data');
+			}
 			if (requestVersion !== trailRequestVersion) return;
 
 			const trailDetail: TrailDetail = {
@@ -1829,6 +2077,8 @@
 				stitch_warnings: sanitizeTrailWarnings(payload?.stitch_warnings)
 			};
 			selectedTrail = trailDetail;
+			navigationTrailId = trailId;
+			if (updateHistory) persistLocation(true);
 			if (trailDetail.start_point?.coordinates) {
 				void refreshWeather(trailDetail.start_point.coordinates);
 			}
@@ -1842,25 +2092,34 @@
 			downloadSectionOpen = false;
 			downloadBusy = false;
 			downloadError = null;
-			void loadElevation(trailId);
-			syncSelectedTrailLayer();
-			fitToSelectedTrail();
+			void loadElevation(trailId, requestVersion);
+			if (fit) fitToSelectedTrail();
 		} catch (error) {
+			if (controller.signal.aborted || isAbortError(error)) return;
 			if (requestVersion !== trailRequestVersion) return;
 			selectedTrail = null;
 			clearSelectedTrailLayer();
 			detailError = error instanceof Error ? error.message : 'Failed to load trail details';
+		} finally {
+			if (trailDetailAbortController === controller) trailDetailAbortController = null;
 		}
 	}
 
-	async function loadElevation(trailId: string) {
+	async function loadElevation(trailId: string, requestVersion: number) {
+		elevationAbortController?.abort();
+		const controller = new AbortController();
+		elevationAbortController = controller;
 		elevationStatus = 'loading';
 		elevationError = null;
 		elevationHoverPosM = null;
 		elevationHoverEleM = null;
 
 		try {
-			const response = await fetch(`/api/trails/${trailId}/elevation`);
+			const response = await requestJson<Record<string, unknown>>(
+				`/api/trails/${trailId}/elevation?revision=${encodeURIComponent(selectedTrail?.data_revision ?? '')}`,
+				{ signal: controller.signal, timeoutMs: 12_000 }
+			);
+			if (controller.signal.aborted || requestVersion !== trailRequestVersion) return;
 			if (response.status === 404) {
 				if (selectedTrail?.id === trailId) {
 					elevationProfile = null;
@@ -1872,7 +2131,8 @@
 				throw new Error(`Elevation request failed with ${response.status}`);
 			}
 
-			const payload = await response.json();
+			const payload = response.data;
+			if (!payload) throw new Error('Elevation service returned invalid data');
 			const profilePoints = sanitizeElevationPoints(payload?.profile_points);
 			const profile: ElevationProfile = {
 				min_elevation_m:
@@ -1887,12 +2147,16 @@
 				elevationStatus = profilePoints.length > 0 ? 'ready' : 'missing';
 			}
 		} catch (error) {
+			if (controller.signal.aborted || isAbortError(error)) return;
+			if (requestVersion !== trailRequestVersion) return;
 			if (selectedTrail?.id === trailId) {
 				elevationProfile = null;
 				elevationStatus = 'error';
 				elevationError =
 					error instanceof Error ? error.message : 'Failed to load elevation profile';
 			}
+		} finally {
+			if (elevationAbortController === controller) elevationAbortController = null;
 		}
 	}
 
@@ -2062,12 +2326,10 @@
 					source: SELECTED_TRAIL_SOURCE,
 					filter: ['==', ['get', 'role'], 'marker'],
 					paint: {
-						'circle-radius': [
-							'match',
-							['get', 'kind'],
-							PROFILE_CURSOR_KIND,
-							9,
-							'start',
+					'circle-radius': [
+						'match',
+						['get', 'kind'],
+						'start',
 							8,
 							'end',
 							8,
@@ -2079,12 +2341,10 @@
 							5,
 							6
 						],
-						'circle-color': [
-							'match',
-							['get', 'kind'],
-							PROFILE_CURSOR_KIND,
-							OUTDOOR_THEME.route.profileCursor,
-							'start',
+					'circle-color': [
+						'match',
+						['get', 'kind'],
+						'start',
 							OUTDOOR_THEME.route.start,
 							'end',
 							OUTDOOR_THEME.route.finish,
@@ -2096,20 +2356,8 @@
 							'#9ca3af',
 							'#f8fafc'
 						],
-						'circle-stroke-color': [
-							'match',
-							['get', 'kind'],
-							PROFILE_CURSOR_KIND,
-							'rgba(255, 255, 255, 0.98)',
-							'#ffffff'
-						],
-						'circle-stroke-width': [
-							'match',
-							['get', 'kind'],
-							PROFILE_CURSOR_KIND,
-							3,
-							2
-						]
+					'circle-stroke-color': '#ffffff',
+					'circle-stroke-width': 2
 					}
 				},
 				overlayAnchorId
@@ -2140,7 +2388,7 @@
 						],
 						'text-anchor': 'top',
 						'text-offset': [0, 1.35],
-						'text-pitch-alignment': 'viewport',
+						'text-pitch-alignment': 'map',
 						'text-rotation-alignment': 'viewport',
 						'text-allow-overlap': true,
 						'text-ignore-placement': true
@@ -2160,6 +2408,52 @@
 				overlayAnchorId
 			);
 		}
+	}
+
+	function syncProfileCursorLayer() {
+		if (!map || !map.isStyleLoaded()) return;
+		const source = map.getSource(SELECTED_TRAIL_CURSOR_SOURCE) as
+			| maplibregl.GeoJSONSource
+			| undefined;
+		if (!selectedTrail && !source) return;
+		const features: GeoJsonFeature[] = [];
+		if (
+			selectedTrail?.geometry &&
+			elevationHoverPosM != null &&
+			elevationHoverEleM != null
+		) {
+			const profileLength = elevationProfile?.profile_points.at(-1)?.pos_m ?? 0;
+			const hoverPoint = routeIndex?.at(profileLength > 0 ? elevationHoverPosM / profileLength : 0);
+			if (hoverPoint) {
+				features.push({
+					type: 'Feature',
+					properties: { kind: PROFILE_CURSOR_KIND },
+					geometry: { type: 'Point', coordinates: hoverPoint }
+				});
+			}
+		}
+
+		const data: GeoJsonFeatureCollection = { type: 'FeatureCollection', features };
+		if (source) {
+			source.setData(data as never);
+			return;
+		}
+
+		map.addSource(SELECTED_TRAIL_CURSOR_SOURCE, { type: 'geojson', data: data as never });
+		addLayerIfMissing(
+			{
+				id: SELECTED_TRAIL_CURSOR_LAYER,
+				type: 'circle',
+				source: SELECTED_TRAIL_CURSOR_SOURCE,
+				paint: {
+					'circle-radius': 9,
+					'circle-color': OUTDOOR_THEME.route.profileCursor,
+					'circle-stroke-color': 'rgba(255, 255, 255, 0.98)',
+					'circle-stroke-width': 3
+				}
+			},
+			resolveOutdoorPoiAnchorId()
+		);
 	}
 
 	function ensureDirectionArrowImage() {
@@ -2248,29 +2542,7 @@
 			});
 		}
 
-		if (
-			selectedTrail?.geometry &&
-			elevationHoverPosM != null &&
-			elevationHoverEleM != null
-		) {
-			const hoverPoint = pointAlongGeometry(selectedTrail.geometry, elevationHoverPosM);
-			if (hoverPoint) {
-				features.push({
-					type: 'Feature',
-					properties: {
-						role: 'marker',
-						kind: PROFILE_CURSOR_KIND,
-						label: formatElevation(elevationHoverEleM)
-					},
-					geometry: {
-						type: 'Point',
-						coordinates: hoverPoint
-					}
-				});
-			}
-		}
-
-		for (const diagnostic of selectedTrail?.stitch_diagnostics ?? []) {
+		for (const diagnostic of qaMode ? selectedTrail?.stitch_diagnostics ?? [] : []) {
 			if (
 				diagnostic.kind === 'open_end' &&
 				(pointMatches(diagnostic.geometry, selectedTrail?.start_point) ||
@@ -2299,6 +2571,10 @@
 	function clearSelectedTrailLayer() {
 		const source = map?.getSource(SELECTED_TRAIL_SOURCE) as maplibregl.GeoJSONSource | undefined;
 		source?.setData(emptyFeatureCollection() as never);
+		const cursorSource = map?.getSource(SELECTED_TRAIL_CURSOR_SOURCE) as
+			| maplibregl.GeoJSONSource
+			| undefined;
+		cursorSource?.setData(emptyFeatureCollection() as never);
 	}
 
 	function emptyFeatureCollection(): GeoJsonFeatureCollection {
@@ -2318,7 +2594,7 @@
 		const rightPadding = window.innerWidth < 740 ? 24 : activeMapPanel ? 440 : 72;
 
 		map.fitBounds(bounds, {
-			padding: { top: 72, right: rightPadding, bottom: 72, left: leftPadding },
+			padding: { top: 72, right: rightPadding, bottom: window.innerWidth < 740 ? window.innerHeight * 0.6 : 72, left: leftPadding },
 			maxZoom: 14,
 			duration: 700
 		});
@@ -2348,37 +2624,6 @@
 		}
 	}
 
-	function pointAlongGeometry(geometry: TrailGeometry, targetDistanceM: number): [number, number] | null {
-		const coordinates = collectCoordinates(geometry);
-		if (coordinates.length === 0) return null;
-		if (coordinates.length === 1) return coordinates[0] ?? null;
-
-		const clampedTarget = Math.max(0, targetDistanceM);
-		let traversed = 0;
-
-		for (let index = 1; index < coordinates.length; index += 1) {
-			const start = coordinates[index - 1];
-			const end = coordinates[index];
-			if (!start || !end) continue;
-
-			const segmentDistance = coordinateDistanceM(start, end);
-			if (segmentDistance <= 0) continue;
-
-			if (traversed + segmentDistance >= clampedTarget) {
-				const remaining = clampedTarget - traversed;
-				const t = Math.min(1, Math.max(0, remaining / segmentDistance));
-				return [
-					start[0] + (end[0] - start[0]) * t,
-					start[1] + (end[1] - start[1]) * t
-				];
-			}
-
-			traversed += segmentDistance;
-		}
-
-		return coordinates[coordinates.length - 1] ?? null;
-	}
-
 	function coordinateDistanceM(a: [number, number], b: [number, number]) {
 		const from = new maplibregl.LngLat(a[0], a[1]);
 		const to = new maplibregl.LngLat(b[0], b[1]);
@@ -2386,6 +2631,11 @@
 	}
 
 	function closePanel() {
+		waypointMarker?.remove();
+		navigationTrailId = null;
+		persistLocation(true);
+		shareMessage = ''; shareFallback = '';
+		abortTrailRequests();
 		selectedTrail = null;
 		clearSelectedMapFeatureLayer();
 		detailError = null;
@@ -2399,6 +2649,11 @@
 		elevationError = null;
 		elevationHoverPosM = null;
 		elevationHoverEleM = null;
+		weatherAbortController?.abort();
+		weatherAbortController = null;
+		weatherForecast = null;
+		weatherStatus = 'idle';
+		weatherError = null;
 		clearRouteChoices();
 		clearSelectedTrailLayer();
 	}
@@ -2532,17 +2787,17 @@
 	}
 
 	function routeChooserPositionFor(point: maplibregl.Point, choiceCount: number) {
-		const panelWidth = 320;
-		const panelHeight = Math.min(440, 134 + choiceCount * 88);
 		const padding = 18;
 		const viewportWidth = mapContainer?.clientWidth ?? window.innerWidth;
 		const viewportHeight = mapContainer?.clientHeight ?? window.innerHeight;
+		const panelWidth = Math.max(0, Math.min(320, viewportWidth - padding * 2));
+		const panelHeight = Math.max(0, Math.min(440, 134 + choiceCount * 88, viewportHeight - padding * 2));
 		const leftPanelInset =
 			detailPanelOpen ? Math.min(460, viewportWidth - 32) + 28 : padding;
-		const minX = Math.min(leftPanelInset, Math.max(padding, viewportWidth - panelWidth - padding));
-		const maxX = viewportWidth - panelWidth - padding;
+		const maxX = Math.max(padding, viewportWidth - panelWidth - padding);
+		const minX = Math.min(leftPanelInset, maxX);
 		const minY = padding;
-		const maxY = viewportHeight - panelHeight - padding;
+		const maxY = Math.max(padding, viewportHeight - panelHeight - padding);
 		const prefersLeftColumn = !detailPanelOpen && point.x > viewportWidth / 2;
 		const preferredX = prefersLeftColumn ? minX : maxX;
 		const preferredY = Math.min(maxY, Math.max(minY, point.y - panelHeight / 2));
@@ -2577,34 +2832,6 @@
 		return `https://www.openstreetmap.org/user/${encodeURIComponent(trail.original_mapper_name)}`;
 	}
 
-	function originalMapperInitials(name: string | null | undefined) {
-		if (!name) return 'OSM';
-		const parts = name.trim().split(/\s+/).filter(Boolean);
-		if (parts.length === 0) return 'OSM';
-		if (parts.length === 1) return Array.from(parts[0]).slice(0, 2).join('').toUpperCase();
-		return `${Array.from(parts[0])[0] ?? ''}${Array.from(parts.at(-1) ?? '')[0] ?? ''}`.toUpperCase();
-	}
-
-	function formatOriginalMappedAt(value: string | null | undefined) {
-		if (!value) return null;
-		const date = new Date(value);
-		if (Number.isNaN(date.getTime())) return null;
-		return new Intl.DateTimeFormat(undefined, {
-			day: 'numeric',
-			month: 'short',
-			year: 'numeric'
-		}).format(date);
-	}
-
-	function formatDistanceCompact(distanceM: number | null) {
-		if (distanceM == null || distanceM < 0) return '—';
-		if (distanceM === 0) return '0 m';
-		const km = distanceM / 1000;
-		if (km >= 10) return `${km.toFixed(0)} km`;
-		if (km >= 1) return `${km.toFixed(1)} km`;
-		return `${Math.round(distanceM)} m`;
-	}
-
 	function sanitizeTrailWarnings(raw: unknown): TrailWarning[] {
 		if (!Array.isArray(raw)) return [];
 		return raw
@@ -2619,21 +2846,21 @@
 	}
 
 	function difficultyLabel(value: string | null) {
-		if (!value) return 'Unrated';
+		if (!value) return 'Difficulty unknown';
 
 		switch (value) {
 			case 'hiking':
-				return 'Easy';
+				return 'Hiking · T1';
 			case 'mountain_hiking':
-				return 'Moderate';
+				return 'Mountain · T2';
 			case 'demanding_mountain_hiking':
-				return 'Challenging';
+				return 'Mountain · T3';
 			case 'alpine_hiking':
-				return 'Hard';
+				return 'Alpine · T4';
 			case 'demanding_alpine_hiking':
-				return 'Severe';
+				return 'Alpine · T5';
 			case 'difficult_alpine_hiking':
-				return 'Expert';
+				return 'Alpine · T6';
 			default:
 				return value.replaceAll('_', ' ');
 		}
@@ -2688,129 +2915,6 @@
 			})
 			.filter((item): item is ElevationPoint => item !== null)
 			.sort((a, b) => a.pos_m - b.pos_m);
-	}
-
-		function elevationChartMetrics(profile: ElevationProfile | null) {
-			const points = profile?.profile_points ?? [];
-			if (points.length === 0) return null;
-
-			const width = 332;
-			const height = 154;
-			const left = 10;
-			const right = 10;
-			const top = 14;
-			const bottom = 26;
-		const maxPos = points[points.length - 1]?.pos_m ?? 0;
-		const minEle =
-			profile?.min_elevation_m ?? Math.min(...points.map((point) => point.ele_m));
-		const maxEle =
-			profile?.max_elevation_m ?? Math.max(...points.map((point) => point.ele_m));
-		const eleRange = Math.max(1, maxEle - minEle);
-		const xScale = (pos: number) =>
-			left + (maxPos <= 0 ? 0 : (pos / maxPos) * (width - left - right));
-		const yScale = (ele: number) =>
-			top + ((maxEle - ele) / eleRange) * (height - top - bottom);
-		const scaledPoints = points.map((point) => ({
-			...point,
-			x: xScale(point.pos_m),
-			y: yScale(point.ele_m)
-		}));
-		const line = scaledPoints
-			.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`)
-			.join(' ');
-		const area = `${line} L ${xScale(maxPos)} ${height - bottom} L ${xScale(0)} ${height - bottom} Z`;
-
-		return {
-			width,
-			height,
-			top,
-			bottom,
-			left,
-			right,
-			maxPos,
-			minEle,
-			maxEle,
-			line,
-			area,
-			scaledPoints,
-			plotWidth: width - left - right,
-			plotHeight: height - top - bottom,
-			startEle: points[0]?.ele_m ?? null,
-			endEle: points[points.length - 1]?.ele_m ?? null
-		};
-	}
-
-	function profileDistanceLabels(metrics: ReturnType<typeof elevationChartMetrics>) {
-		if (!metrics) return [];
-		const ticks = [0, 0.25, 0.5, 0.75, 1];
-		return ticks.map((fraction) => {
-			const pos = metrics.left + fraction * metrics.plotWidth;
-			const distance = metrics.maxPos * fraction;
-			return { pos, label: formatDistanceCompact(distance) };
-		});
-	}
-
-	function profileElevationGuides(metrics: ReturnType<typeof elevationChartMetrics>) {
-		if (!metrics) return [];
-		const values = [metrics.maxEle, (metrics.maxEle + metrics.minEle) / 2, metrics.minEle];
-		return values.map((ele) => ({
-			ele,
-			y:
-				metrics.top +
-				((metrics.maxEle - ele) / Math.max(1, metrics.maxEle - metrics.minEle)) * metrics.plotHeight
-		}));
-	}
-
-	function profileHoverState(
-		metrics: ReturnType<typeof elevationChartMetrics>,
-		xFraction: number
-	) {
-		if (!metrics || metrics.scaledPoints.length === 0) return null;
-		const targetPos = metrics.maxPos * Math.min(1, Math.max(0, xFraction));
-		let nearest = metrics.scaledPoints[0];
-		for (const point of metrics.scaledPoints) {
-			if (Math.abs(point.pos_m - targetPos) < Math.abs(nearest.pos_m - targetPos)) {
-				nearest = point;
-			}
-		}
-
-		return {
-			...nearest,
-			gradePct: profileGradeAt(metrics.scaledPoints, nearest.pos_m)
-		};
-	}
-
-	function profileGradeAt(points: Array<ElevationPoint & { x: number; y: number }>, posM: number) {
-		if (points.length < 2) return null;
-		let index = points.findIndex((point) => point.pos_m >= posM);
-		if (index < 0) index = points.length - 1;
-		const prev = points[Math.max(0, index - 1)];
-		const next = points[Math.min(points.length - 1, index + 1)];
-		if (!prev || !next || next.pos_m === prev.pos_m) return null;
-		return ((next.ele_m - prev.ele_m) / (next.pos_m - prev.pos_m)) * 100;
-	}
-
-	function handleProfilePointerMove(
-		event: PointerEvent,
-		metrics: NonNullable<ReturnType<typeof elevationChartMetrics>>
-	) {
-		const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
-		if (bounds.width <= 0) return;
-		const xFraction = (event.clientX - bounds.left) / bounds.width;
-		const hover = profileHoverState(metrics, xFraction);
-		if (!hover) return;
-		elevationHoverPosM = hover.pos_m;
-		elevationHoverEleM = hover.ele_m;
-	}
-
-	function clearProfileHover() {
-		elevationHoverPosM = null;
-		elevationHoverEleM = null;
-	}
-
-	function activeProfileHover(metrics: NonNullable<ReturnType<typeof elevationChartMetrics>>) {
-		if (elevationHoverPosM == null) return null;
-		return profileHoverState(metrics, metrics.maxPos <= 0 ? 0 : elevationHoverPosM / metrics.maxPos);
 	}
 
 	function directionSourceLabel(value: string | null | undefined) {
@@ -3091,37 +3195,58 @@
 		return match?.[1] ?? null;
 	}
 
-	async function downloadRoute() {
-		if (!selectedTrail) return;
+	async function downloadRoute(formatOverride?: 'gpx' | 'kml' | 'geojson') {
+		const trail = selectedTrail;
+		if (!trail) return;
+		const format = formatOverride ?? downloadFormat;
+		const direction = directionMode;
+		abortDownloadRequest();
+		const requestVersion = downloadRequestVersion;
+		const controller = new AbortController();
+		downloadAbortController = controller;
 
 		downloadBusy = true;
 		downloadError = null;
 
 		try {
 			const params = new URLSearchParams({
-				format: downloadFormat,
-				direction: directionMode
+				format,
+				direction,
+				revision: trail.data_revision ?? ''
 			});
-			const response = await fetch(`/api/trails/${selectedTrail.id}/download?${params.toString()}`);
+			const response = await requestBlob(`/api/trails/${trail.id}/download?${params.toString()}`, {
+				signal: controller.signal,
+				timeoutMs: 30_000
+			});
+			if (controller.signal.aborted || requestVersion !== downloadRequestVersion) return;
 			if (!response.ok) {
-				throw new Error(`Download request failed with ${response.status}`);
+				throw new Error(response.status === 409 ? 'This route has changed. Reopen it before downloading.' : `Download request failed with ${response.status}`);
 			}
 
-			const blob = await response.blob();
+			if (!response.data || response.data.size === 0) {
+				throw new Error('Download service returned an empty file');
+			}
+			const blob = response.data;
 			const objectUrl = URL.createObjectURL(blob);
 			const link = document.createElement('a');
 			link.href = objectUrl;
 			link.download =
 				downloadFilenameFromHeader(response.headers.get('content-disposition')) ??
-				`${selectedTrail.id}.${downloadFormat}`;
+				`${trail.id}.${format}`;
 			document.body.appendChild(link);
 			link.click();
 			link.remove();
-			URL.revokeObjectURL(objectUrl);
+			setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 		} catch (error) {
+			if (controller.signal.aborted || requestVersion !== downloadRequestVersion || isAbortError(error)) {
+				return;
+			}
 			downloadError = error instanceof Error ? error.message : 'Failed to download route';
 		} finally {
-			downloadBusy = false;
+			if (downloadAbortController === controller && requestVersion === downloadRequestVersion) {
+				downloadAbortController = null;
+				downloadBusy = false;
+			}
 		}
 	}
 </script>
@@ -3166,8 +3291,9 @@
 				<input
 					bind:this={searchInput}
 					class="search-input"
+					aria-label="Search trails or places"
 					type="search"
-					placeholder={mapVisualReady ? 'Search country, state, district, village, trail…' : 'Preparing map search…'}
+					placeholder={mapVisualReady ? 'Search trails or places…' : 'Preparing map search…'}
 					disabled={!mapVisualReady}
 					value={searchQuery}
 					oninput={handleSearchInput}
@@ -3256,6 +3382,8 @@
 		</div>
 	</div>
 
+	<TrailDiscovery bounds={discoveryBounds} hidden={detailPanelOpen || searchPanelOpen || !mapVisualReady || activeMapPanel !== null} onselect={(id) => void loadTrail(id)} onhover={(id) => hoveredRouteChoiceId = id} />
+
 	<div class="terrain-dock">
 		<div class="map-tool-rail" role="toolbar" aria-label="Outdoor map tools">
 			<button class:active={activeMapPanel === 'layers'} type="button" onclick={() => toggleMapPanel('layers')} aria-label="Map layers" aria-pressed={activeMapPanel === 'layers'} title="Map layers">
@@ -3280,48 +3408,47 @@
 				</div>
 
 				{#if activeMapPanel === 'layers'}
-					<div class="terrain-control-list">
-						<label class="terrain-switch"><div><strong>Known hiking routes</strong><p>Recognized OSM walking-route relations in signal red.</p></div><input type="checkbox" bind:checked={knownRoutesVisible} /></label>
-						<label class="terrain-switch"><div><strong>Route names</strong><p>Scale-aware international, regional, and local route labels.</p></div><input type="checkbox" bind:checked={routeLabelsVisible} disabled={!knownRoutesVisible} /></label>
-						<label class="terrain-switch"><div><strong>Ordinary paths</strong><p>Neutral dashed footpaths beneath the known-route network.</p></div><input type="checkbox" bind:checked={ordinaryPathsVisible} /></label>
-						<label class="terrain-switch"><div><strong>Outdoor places</strong><p>Rescue, huts, water, and trailheads first; local comforts appear as you zoom in.</p></div><input type="checkbox" bind:checked={outdoorPoisVisible} /></label>
-						<label class="terrain-switch"><div><strong>Peaks</strong><p>Highest summits first; nearby peaks appear as you zoom in.</p></div><input type="checkbox" bind:checked={peakLabelsVisible} /></label>
-						<label class="terrain-switch"><div><strong>Region boundaries</strong><p>Administrative context for trip discovery.</p></div><input type="checkbox" bind:checked={regionBoundariesVisible} /></label>
-					</div>
+					<LayersPanel
+						knownRoutesVisible={knownRoutesVisible}
+						routeLabelsVisible={routeLabelsVisible}
+						routeLabelsDisabled={!knownRoutesVisible}
+						ordinaryPathsVisible={ordinaryPathsVisible}
+						outdoorPoisVisible={outdoorPoisVisible}
+						peakLabelsVisible={peakLabelsVisible}
+						regionBoundariesVisible={regionBoundariesVisible}
+						onKnownRoutesToggle={(v) => (knownRoutesVisible = v)}
+						onRouteLabelsToggle={(v) => (routeLabelsVisible = v)}
+						onOrdinaryPathsToggle={(v) => (ordinaryPathsVisible = v)}
+						onOutdoorPoisToggle={(v) => (outdoorPoisVisible = v)}
+						onPeakLabelsToggle={(v) => (peakLabelsVisible = v)}
+						onRegionBoundariesToggle={(v) => (regionBoundariesVisible = v)}
+					/>
 				{:else if activeMapPanel === 'terrain'}
-					<div class="terrain-control-list">
-						<label class="terrain-switch"><div><strong>Hillshade</strong><p>Multidirectional relief for slopes, gullies, and ridgelines.</p></div><input type="checkbox" checked={terrainHillshadeVisible} disabled={!terrainReady} onchange={(event) => setTerrainHillshadeEnabled((event.currentTarget as HTMLInputElement).checked)} /></label>
-						{#if terrainColorReliefSupported}<label class="terrain-switch"><div><strong>Elevation tint</strong><p>A subtle regional height wash; off by default for clarity.</p></div><input type="checkbox" checked={terrainColorReliefVisible} disabled={!terrainReady} onchange={(event) => setTerrainColorReliefEnabled((event.currentTarget as HTMLInputElement).checked)} /></label>{/if}
-						{#if terrainSlopeSupported}<label class="terrain-switch"><div><strong>Slope angle</strong><p>Optional DEM steepness bands for terrain planning; not an avalanche-danger layer.</p></div><input type="checkbox" checked={terrainSlopeVisible} disabled={!terrainReady} onchange={(event) => setTerrainSlopeEnabled((event.currentTarget as HTMLInputElement).checked)} /></label>{/if}
-						<label class="terrain-switch"><div><strong>Contours</strong><p>Scale-aware minor, intermediate, and index contours.</p></div><input type="checkbox" checked={terrainContoursVisible} disabled={!terrainReady} onchange={(event) => setTerrainContoursEnabled((event.currentTarget as HTMLInputElement).checked)} /></label>
-					</div>
-					{#if terrainSlopeSupported && terrainSlopeVisible}
-						<div class="slope-panel" aria-label="Slope angle legend">
-							<div class="terrain-slider-row"><span class="terrain-fieldset-label">Slope opacity</span><strong>{Math.round(terrainSlopeOpacity * 100)}%</strong></div>
-							<input class="terrain-slider" aria-label="Slope opacity" type="range" min="0.25" max="1" step="0.05" value={terrainSlopeOpacity} oninput={(event) => setTerrainSlopeOpacity(Number((event.currentTarget as HTMLInputElement).value))} />
-							<div class="slope-legend">
-								<span><i class="slope-swatch clear"></i>&lt;{SLOPE_CLEAR_BELOW}° clear</span>
-								{#each SLOPE_BANDS as band}<span><i class="slope-swatch" style={`--slope-color: rgba(${band.color.join(', ')}, ${band.alpha})`}></i>{band.label}</span>{/each}
-							</div>
-							<p class="slope-note">{SLOPE_PLANNING_NOTE}</p>
-						</div>
-					{/if}
-					<div class="terrain-fieldset">
-						<span class="terrain-fieldset-label">Contour unit</span>
-						<div class="terrain-segmented"><label><input type="radio" name="terrain-unit" checked={terrainContourUnit === 'meters'} onchange={() => setTerrainContourUnit('meters')} /><span>meters</span></label><label><input type="radio" name="terrain-unit" checked={terrainContourUnit === 'feet'} onchange={() => setTerrainContourUnit('feet')} /><span>feet</span></label></div>
-					</div>
-					{#if terrain3dEnabled}
-						<div class="view-presets" aria-label="3D view presets">
-							<button class:active={mapPitch < 72} type="button" onclick={() => set3DViewPreset('terrain')}>Terrain view</button>
-							<button class:active={mapPitch >= 72} type="button" onclick={() => set3DViewPreset('horizon')}>Low horizon</button>
-						</div>
-						<div class="terrain-fieldset camera-controls">
-							<div class="terrain-slider-row"><span class="terrain-fieldset-label">Camera pitch</span><strong>{mapPitch}°</strong></div>
-							<input class="terrain-slider" type="range" min="20" max="82" step="1" value={mapPitch} oninput={(event) => setMapPitchValue(Number((event.currentTarget as HTMLInputElement).value))} />
-							<div class="terrain-slider-row bearing-row"><span class="terrain-fieldset-label">Bearing</span><strong>{mapBearing}°</strong></div>
-							<div class="bearing-actions"><button type="button" onclick={() => rotateMap(-30)}>↶ 30°</button><button type="button" onclick={() => setMapBearingValue(0)}>North</button><button type="button" onclick={() => rotateMap(30)}>30° ↷</button></div>
-						</div>
-					{/if}
+					<TerrainControls
+						mapZoom={mapZoom}
+						mapPitch={mapPitch}
+						mapBearing={mapBearing}
+						terrain3dEnabled={terrain3dEnabled}
+						terrainReady={terrainReady}
+						terrainHillshadeVisible={terrainHillshadeVisible}
+						terrainColorReliefVisible={terrainColorReliefVisible}
+						terrainColorReliefSupported={terrainColorReliefSupported}
+						terrainSlopeVisible={terrainSlopeVisible}
+						terrainSlopeSupported={terrainSlopeSupported}
+						terrainSlopeOpacity={terrainSlopeOpacity}
+						terrainContoursVisible={terrainContoursVisible}
+						terrainContourUnit={terrainContourUnit}
+						onHillshadeToggle={setTerrainHillshadeEnabled}
+						onColorReliefToggle={setTerrainColorReliefEnabled}
+						onSlopeToggle={setTerrainSlopeEnabled}
+						onContoursToggle={setTerrainContoursEnabled}
+						onSlopeOpacityChange={setTerrainSlopeOpacity}
+						onContourUnitChange={setTerrainContourUnit}
+						onSet3DViewPreset={set3DViewPreset}
+						onMapPitchChange={setMapPitchValue}
+						onMapBearingChange={setMapBearingValue}
+						onRotateMap={rotateMap}
+					/>
 				{/if}
 			</aside>
 		{/if}
@@ -3477,38 +3604,13 @@
 
 				<div class="hero">
 					<p class="eyebrow">
-						{difficultyLabel(selectedTrail.difficulty)}
-						{#if selectedTrail.network}
-							<span>• {selectedTrail.network}</span>
-						{/if}
+						{difficultyLabel(selectedTrail.difficulty)} · {hikeTypeLabel(selectedTrail.hike_type)}
+
 					</p>
 					<h2>{selectedTrail.name ?? 'Unnamed trail'}</h2>
 					{#if selectedTrail.summary}
 						<p class="summary">{selectedTrail.summary}</p>
 					{/if}
-				</div>
-
-				<div class:unavailable={!selectedTrail.original_mapper_name} class="mapper-credit">
-					<span class="mapper-avatar" aria-hidden="true">
-						{originalMapperInitials(selectedTrail.original_mapper_name)}
-					</span>
-					<div>
-						<span class="mapper-label">Mapped by</span>
-						{#if originalMapperProfileUrl(selectedTrail)}
-							<a href={originalMapperProfileUrl(selectedTrail) ?? undefined} target="_blank" rel="noreferrer">
-								{selectedTrail.original_mapper_name}
-							</a>
-						{:else}
-							<strong>{selectedTrail.original_mapper_name ?? 'OpenStreetMap contributors'}</strong>
-						{/if}
-						<p>
-							{#if selectedTrail.original_mapper_name}
-								Original OSM route relation creator{formatOriginalMappedAt(selectedTrail.original_mapped_at) ? ` · ${formatOriginalMappedAt(selectedTrail.original_mapped_at)}` : ''}
-							{:else}
-								Original mapper attribution has not been imported yet.
-							{/if}
-						</p>
-					</div>
 				</div>
 
 				<div class="stats">
@@ -3525,23 +3627,50 @@
 						<strong>{formatElevation(selectedTrail.descent_m)}</strong>
 					</div>
 					<div>
-						<span>Estimated time</span>
-						<strong>{formatDuration(selectedTrail.estimated_duration_min)}</strong>
-					</div>
-					<div>
-						<span>Hike type</span>
-						<strong>{hikeTypeLabel(selectedTrail.hike_type)}</strong>
-					</div>
-					<div>
-						<span>Difficulty</span>
-						<strong>{difficultyLabel(selectedTrail.difficulty)}</strong>
+						<span>Est. time</span>
+						<strong title={formatDuration(selectedTrail.estimated_duration_min)}>{formatDuration(selectedTrail.estimated_duration_min).replaceAll(' hr', 'h').replaceAll(' min', 'm')}</strong>
 					</div>
 				</div>
 
+				{#if incompleteRoute}
+					<div class="route-quality" role="note"><strong>Partial route</strong><p>The source has disconnected or missing sections. The line, distance, profile and download cover only the reconstructed portion.</p></div>
+				{/if}
+
 				<div class="trail-quick-actions" aria-label="Trail actions">
 					<button type="button" onclick={fitToSelectedTrail}><span>◎</span>Center</button>
-					<button type="button" onclick={downloadRoute} disabled={downloadBusy}><span>⇩</span>{downloadBusy ? 'Preparing…' : 'Export GPX'}</button>
+					<button type="button" onclick={shareTrail}><span>↗</span>Share</button>
+					<button type="button" onclick={() => downloadRoute('gpx')} disabled={downloadBusy}><span>⇩</span>{downloadBusy ? 'Preparing…' : 'Export GPX'}</button>
 				</div>
+
+				{#if shareMessage}<p class="share-status" role="status">{shareMessage}</p>{/if}
+				{#if shareFallback}<input class="share-link" aria-label="Share link" readonly value={shareFallback} onfocus={event => event.currentTarget.select()} />{/if}
+				{#if downloadError}<p class="download-error" role="alert">{downloadError}</p>{/if}
+				<section class="section elevation-section">
+					{#if elevationStatus === 'ready' && elevationProfile}
+						<ElevationChart points={elevationProfile.profile_points} onpreview={point => { elevationHoverPosM = point?.pos_m ?? null; elevationHoverEleM = point?.ele_m ?? null; }} />
+					{:else if elevationStatus === 'loading'}<p class="analysis-note">Loading elevation…</p>
+					{:else if elevationStatus === 'error'}<p class="analysis-note">Couldn’t load elevation. Reload the route to try again.</p><button type="button" onclick={() => selectedTrail && loadTrail(selectedTrail.id, false, false)}>Reload route</button>
+					{:else}<p class="analysis-note">Elevation is unavailable for this route.</p>{/if}
+					<p class="analysis-note">Distances follow the mapped route. Time estimates exclude breaks and changing trail conditions.</p>
+				</section>
+				<p class="source-credit">Map data © OpenStreetMap contributors{#if selectedTrail.original_mapper_name}. Route first added by {#if originalMapperProfileUrl(selectedTrail)}<a href={originalMapperProfileUrl(selectedTrail)} target="_blank" rel="noreferrer">{selectedTrail.original_mapper_name}</a>{:else}{selectedTrail.original_mapper_name}{/if}{/if}. <a href={`https://www.openstreetmap.org/relation/${selectedTrail.osm_relation_id}`} target="_blank" rel="noreferrer">View source route ↗</a></p>
+
+				{#if selectedTrail.cautions?.length}
+					<section class="section">
+						<h3>Access & trail notes</h3>
+						<ul class="caution-list">{#each selectedTrail.cautions as caution}<li>{caution.message} <a href={caution.source_url} target="_blank" rel="noreferrer">Source ↗</a></li>{/each}</ul>
+					</section>
+				{/if}
+				{#if selectedTrail.waypoints.length}
+					<details class="section waypoint-section">
+						<summary>Near the route · {selectedTrail.waypoints.length} mapped places</summary>
+						<p class="analysis-note">Within 150 m of the mapped line; a place may require a detour. A mapped water source does not confirm drinking-water quality.</p>
+						<div class="waypoint-list">{#each selectedTrail.waypoints as waypoint}
+							<button type="button" disabled={waypoint.longitude == null || waypoint.latitude == null} onclick={() => showWaypoint(waypoint)}><span><strong>{waypoint.name ?? surfaceLabel(waypoint.kind)}</strong><small>{surfaceLabel(waypoint.kind)}{waypoint.elevation_m != null ? ` · ${Math.round(waypoint.elevation_m)} m` : ''}</small></span><span aria-hidden="true">◎</span></button>
+						{/each}</div>
+					</details>
+				{/if}
+				<details class="section weather-section"><summary>Trailhead weather</summary>
 
 				<WeatherSummary
 					forecast={weatherForecast}
@@ -3552,128 +3681,7 @@
 					onrefresh={() => refreshWeather(selectedTrail?.start_point?.coordinates ?? undefined, true)}
 				/>
 
-				<section class="section">
-					<h3>Elevation profile</h3>
-					{#if elevationStatus === 'loading'}
-						<div class="meta-card">
-							<strong>Loading profile…</strong>
-							<p>Fetching elevation samples for this route.</p>
-						</div>
-					{:else if elevationStatus === 'ready' && elevationProfile}
-						{@const metrics = elevationChartMetrics(elevationProfile)}
-						{#if metrics}
-							{@const hover = activeProfileHover(metrics)}
-								<div class="profile-shell">
-									<div
-										class="profile-chart"
-									>
-									<div class="profile-chart-header">
-										<div>
-											<span class="profile-kicker">Elevation profile</span>
-											<strong>{formatDistanceCompact(metrics.maxPos)}</strong>
-										</div>
-										<div class="profile-range">
-											<span>{formatElevation(metrics.minEle)}</span>
-											<span>{formatElevation(metrics.maxEle)}</span>
-										</div>
-									</div>
-									<svg
-										viewBox={`0 0 ${metrics.width} ${metrics.height}`}
-										role="img"
-										aria-label="Elevation profile chart"
-										onpointermove={(event) => handleProfilePointerMove(event, metrics)}
-										onpointerleave={clearProfileHover}
-									>
-										<defs>
-											<linearGradient id="elevation-fill" x1="0" x2="0" y1="0" y2="1">
-												<stop offset="0%" stop-color="rgba(36, 94, 231, 0.42)" />
-												<stop offset="100%" stop-color="rgba(36, 94, 231, 0.05)" />
-											</linearGradient>
-										</defs>
-										{#each profileElevationGuides(metrics) as guide}
-											<line
-												x1={metrics.left}
-												y1={guide.y}
-												x2={metrics.width - metrics.right}
-												y2={guide.y}
-												class="profile-grid"
-											/>
-											<text
-												x={metrics.width - metrics.right}
-												y={guide.y - 4}
-												class="profile-elevation-label"
-												text-anchor="end"
-											>
-												{formatElevation(guide.ele)}
-											</text>
-										{/each}
-										<path d={metrics.area} class="profile-area" />
-										<path d={metrics.line} class="profile-line" />
-										{#if hover}
-											<line
-												x1={hover.x}
-												y1={metrics.top}
-												x2={hover.x}
-												y2={metrics.height - metrics.bottom}
-												class="profile-guide"
-											/>
-											<circle cx={hover.x} cy={hover.y} r="4.5" class="profile-focus-ring" />
-											<circle cx={hover.x} cy={hover.y} r="3.1" class="profile-focus-dot" />
-										{/if}
-										{#each profileDistanceLabels(metrics) as tick}
-											<text x={tick.pos} y={metrics.height - 6} class="profile-label" text-anchor="middle">
-												{tick.label}
-											</text>
-										{/each}
-									</svg>
-									{#if hover}
-										<div
-											class="profile-tooltip"
-											style={`left:${Math.min(84, Math.max(16, ((hover.x - metrics.left) / Math.max(1, metrics.plotWidth)) * 100))}%;`}
-										>
-											<strong>{formatDistanceCompact(hover.pos_m)}</strong>
-											<span>{formatElevation(hover.ele_m)}</span>
-											{#if hover.gradePct != null}
-												<span>Grade {hover.gradePct > 0 ? '+' : ''}{hover.gradePct.toFixed(0)}%</span>
-											{/if}
-										</div>
-									{/if}
-								</div>
-									<div class="meta-grid profile-meta-grid">
-										<div class="meta-card">
-											<span>Start</span>
-											<strong>{formatElevation(metrics.startEle)}</strong>
-									</div>
-									<div class="meta-card">
-										<span>Peak</span>
-										<strong>{formatElevation(metrics.maxEle)}</strong>
-									</div>
-										<div class="meta-card">
-											<span>Finish</span>
-											<strong>{formatElevation(metrics.endEle)}</strong>
-										</div>
-									</div>
-									<p class="profile-helper">
-										{#if hover}
-											Previewing {formatDistanceCompact(hover.pos_m)} at {formatElevation(hover.ele_m)} on the route.
-										{:else}
-											Move across the chart to preview the matching point on the trail.
-										{/if}
-									</p>
-								</div>
-						{/if}
-					{:else if elevationStatus === 'missing'}
-						<div class="meta-card">
-							<strong>No elevation profile yet</strong>
-							<p>This trail does not have generated elevation samples yet. Re-run the importer with `DEM_PATH` configured to populate this route.</p>
-						</div>
-					{:else if elevationStatus === 'error'}
-						<div class="meta-card">
-							<strong>Couldn’t load profile</strong>
-							<p>{elevationError ?? 'Something went wrong while loading the elevation profile.'}</p>
-						</div>
-					{/if}
-				</section>
+				</details>
 
 				{#if selectedTrail.features.length > 0}
 					<section class="section">
@@ -3686,7 +3694,7 @@
 					</section>
 				{/if}
 
-				{#if selectedTrail.route_from || selectedTrail.route_to || selectedTrail.route_via || selectedTrail.route_tag || selectedTrail.network_type || selectedTrail.website_url || selectedTrail.video_url || selectedTrail.direction_source}
+				{#if selectedTrail.route_from || selectedTrail.route_to || selectedTrail.route_via || selectedTrail.website_url || selectedTrail.video_url || (qaMode && (selectedTrail.route_tag || selectedTrail.network_type || selectedTrail.direction_source))}
 					<section class="section">
 						<h3>Route details</h3>
 						<div class="meta-grid">
@@ -3696,19 +3704,19 @@
 									<strong>{directionLabel('forward', selectedTrail)}</strong>
 								</div>
 							{/if}
-							{#if selectedTrail.route_tag}
+							{#if qaMode && selectedTrail.route_tag}
 								<div class="meta-card">
 									<span>Route tag</span>
 									<strong>{selectedTrail.route_tag}</strong>
 								</div>
 							{/if}
-							{#if selectedTrail.network_type}
+							{#if qaMode && selectedTrail.network_type}
 								<div class="meta-card">
 									<span>Network type</span>
 									<strong>{selectedTrail.network_type}</strong>
 								</div>
 							{/if}
-							{#if selectedTrail.direction_source}
+							{#if qaMode && selectedTrail.direction_source}
 								<div class="meta-card">
 									<span>Direction basis</span>
 									<strong>{directionSourceLabel(selectedTrail.direction_source)}</strong>
@@ -3810,7 +3818,7 @@
 							</div>
 						</div>
 
-						<button class="download-button" type="button" disabled={downloadBusy} onclick={downloadRoute}>
+						<button class="download-button" type="button" disabled={downloadBusy} onclick={() => downloadRoute()}>
 							{downloadBusy ? 'Preparing file…' : 'Get file'}
 						</button>
 
@@ -3820,7 +3828,7 @@
 					{/if}
 				</section>
 
-				{#if selectedTrail.start_point || selectedTrail.end_point || selectedTrail.stitch_warnings.length > 0}
+				{#if qaMode && (selectedTrail.start_point || selectedTrail.end_point || selectedTrail.stitch_warnings.length > 0)}
 					<section class="section">
 						<h3>Analyze relation</h3>
 						<p class="analysis-note">
@@ -4145,6 +4153,17 @@
 	:global(.maplibregl-ctrl-bottom-left) {
 		left: 1rem;
 		bottom: 0.9rem;
+	}
+
+	:global(.maplibregl-ctrl-bottom-right) {
+		right: 0.75rem;
+		bottom: 0.55rem;
+		max-width: calc(100% - 1.5rem);
+	}
+
+	:global(.maplibregl-ctrl-attrib) {
+		background: rgba(250, 247, 238, 0.9);
+		color: #25302a;
 	}
 
 	:global(.maplibregl-ctrl-scale) {
@@ -4798,7 +4817,7 @@
 		}
 
 		.breadcrumb {
-			margin: 2.75rem 0 0.7rem;
+			margin: 0.2rem 2.6rem 0.65rem 0;
 			font-size: 0.76rem;
 			letter-spacing: 0.08em;
 			text-transform: uppercase;
@@ -4822,11 +4841,6 @@
 		color: #ffd54f;
 	}
 
-	.eyebrow span {
-		color: var(--ui-muted);
-		font-weight: 500;
-	}
-
 		.summary {
 			margin: 0.72rem 0 0;
 			color: #c7d0d8;
@@ -4834,85 +4848,26 @@
 			font-size: 0.95rem;
 		}
 
-	.mapper-credit {
-		display: flex;
-		align-items: center;
-		gap: 0.78rem;
-		margin-top: 1rem;
-		padding: 0.82rem 0.9rem;
-		border: 1px solid rgba(121, 198, 155, 0.2);
-		border-radius: 16px;
-		background: linear-gradient(145deg, rgba(121, 198, 155, 0.12), rgba(46, 102, 83, 0.08));
-	}
+	.caution-list {padding-left:1.1rem;font-size:.83rem;line-height:1.55;color:var(--ui-muted)}
+	.caution-list li {margin-bottom:.55rem}.caution-list a {color:var(--ui-focus);white-space:nowrap}
+	.waypoint-section summary,.weather-section summary {cursor:pointer;font-size:.88rem;font-weight:650;padding:.2rem 0}
+	.waypoint-list {max-height:270px;overflow:auto;overscroll-behavior:contain}.waypoint-list button {display:flex;justify-content:space-between;align-items:center;text-align:left;width:100%;padding:.7rem .2rem;background:transparent;border:0;border-bottom:1px solid var(--ui-border);color:var(--ui-text);cursor:pointer}.waypoint-list small {display:block;color:var(--ui-muted);font-size:.73rem;margin-top:.25rem}
 
-	.mapper-credit.unavailable {
-		border-color: rgba(255, 255, 255, 0.08);
-		background: rgba(255, 255, 255, 0.035);
-	}
-
-	.mapper-avatar {
-		display: grid;
-		place-items: center;
-		flex: 0 0 auto;
-		width: 2.55rem;
-		height: 2.55rem;
-		border-radius: 50%;
-		background: var(--ui-brand);
-		box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.12);
-		color: #fff9ec;
-		font-size: 0.72rem;
-		font-weight: 850;
-		letter-spacing: 0.03em;
-	}
-
-	.mapper-credit.unavailable .mapper-avatar {
-		background: rgba(255, 255, 255, 0.1);
-		color: var(--ui-muted);
-	}
-
-	.mapper-credit > div {
-		min-width: 0;
-	}
-
-	.mapper-label {
-		display: block;
-		margin-bottom: 0.14rem;
-		color: var(--ui-focus);
-		font-size: 0.68rem;
-		font-weight: 800;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-	}
-
-	.mapper-credit strong,
-	.mapper-credit a {
-		color: var(--ui-text);
-		font-size: 0.98rem;
-		font-weight: 780;
-		text-decoration: none;
-	}
-
-	.mapper-credit a:hover {
-		color: #b8e8ca;
-		text-decoration: underline;
-	}
-
-	.mapper-credit p {
-		margin: 0.2rem 0 0;
-		color: var(--ui-muted);
-		font-size: 0.75rem;
-		line-height: 1.35;
-	}
+	.source-credit,.share-status { font-size:.75rem; line-height:1.5; color:var(--ui-muted); }
+	.source-credit a { color:var(--ui-focus); }
+	.share-link { width:100%;box-sizing:border-box;padding:.7rem;border:1px solid var(--ui-border);border-radius:8px; }
+	.route-quality { margin-top:.85rem;padding:.65rem .8rem;background:#a4752026;border:1px solid #d9ad5a55;border-radius:12px;color:#eedab1;font-size:.8rem; }
+	.route-quality p { margin:.3rem 0 0;line-height:1.45; }
 
 		.stats {
 			display: grid;
-			grid-template-columns: repeat(3, minmax(0, 1fr));
-			gap: 0.75rem;
-			margin-top: 1.15rem;
+			grid-template-columns: repeat(4, minmax(0, 1fr));
+			gap: 0.5rem;
+			margin-top: 0.8rem;
 		}
 
 		.stats div {
-			padding: 0.85rem 0.9rem;
+			padding: 0.7rem 0.6rem;
 			border-radius: 16px;
 			background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.03));
 		}
@@ -4920,14 +4875,14 @@
 	.stats span {
 		display: block;
 		margin-bottom: 0.35rem;
-		font-size: 0.82rem;
+		font-size: 0.68rem;
 		color: var(--ui-muted);
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 	}
 
 		.stats strong {
-			font-size: 1.02rem;
+			font-size: 0.9rem;
 		}
 
 	.feature-stats {
@@ -4944,7 +4899,7 @@
 
 	.trail-quick-actions {
 		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
+		grid-template-columns: repeat(3, minmax(0, 1fr));
 		gap: 0.55rem;
 		margin: 0.8rem 0;
 	}
@@ -5068,155 +5023,6 @@
 	.meta-link:hover {
 		text-decoration: underline;
 	}
-
-		.profile-shell {
-			display: grid;
-			gap: 0.7rem;
-		}
-
-		.profile-chart {
-			position: relative;
-			padding: 0.82rem 0.82rem 0.34rem;
-			border: 1px solid rgba(202, 212, 194, 0.44);
-			border-radius: 20px;
-			background:
-				radial-gradient(circle at top, rgba(125, 175, 111, 0.14), transparent 48%),
-				linear-gradient(180deg, rgba(252, 253, 249, 0.985), rgba(243, 247, 239, 0.955));
-			box-shadow:
-				0 12px 28px rgba(17, 24, 17, 0.14),
-				inset 0 1px 0 rgba(255, 255, 255, 0.75);
-			cursor: crosshair;
-		}
-
-		.profile-chart-header {
-			display: flex;
-			align-items: flex-start;
-			justify-content: space-between;
-			gap: 1rem;
-			margin-bottom: 0.25rem;
-			color: #1d271a;
-		}
-
-	.profile-kicker {
-		display: block;
-		margin-bottom: 0.12rem;
-		font-size: 0.68rem;
-		font-weight: 700;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		color: #678064;
-	}
-
-		.profile-chart-header strong {
-			display: block;
-			font-size: 0.96rem;
-			font-weight: 800;
-		}
-
-		.profile-range {
-			display: flex;
-			flex-direction: column;
-			align-items: flex-end;
-			gap: 0.12rem;
-			font-size: 0.74rem;
-			font-weight: 700;
-			color: #64715b;
-		}
-
-	.profile-chart svg {
-		display: block;
-		width: 100%;
-		height: auto;
-		overflow: visible;
-	}
-
-	.profile-grid {
-		stroke: rgba(36, 94, 231, 0.14);
-		stroke-width: 1;
-		stroke-dasharray: 4 5;
-	}
-
-	.profile-area {
-		fill: url(#elevation-fill);
-	}
-
-		.profile-line {
-			fill: none;
-			stroke: #245ee7;
-			stroke-width: 2.15;
-			stroke-linejoin: round;
-			stroke-linecap: round;
-		}
-
-	.profile-guide {
-		stroke: rgba(23, 53, 95, 0.3);
-		stroke-width: 1.4;
-		stroke-dasharray: 4 5;
-	}
-
-	.profile-focus-ring {
-		fill: rgba(36, 94, 231, 0.2);
-		stroke: rgba(255, 255, 255, 0.94);
-		stroke-width: 2;
-	}
-
-	.profile-focus-dot {
-		fill: #245ee7;
-		stroke: rgba(23, 53, 95, 0.62);
-		stroke-width: 1;
-	}
-
-	.profile-label {
-		fill: #6c7864;
-		font-size: 10px;
-		font-family: 'Avenir Next', 'Segoe UI', ui-sans-serif, system-ui, sans-serif;
-	}
-
-	.profile-elevation-label {
-		fill: #556378;
-		stroke: rgba(250, 247, 238, 0.94);
-		stroke-width: 2.6px;
-		paint-order: stroke;
-		font-size: 8px;
-		font-weight: 700;
-	}
-
-		.profile-tooltip {
-			position: absolute;
-			top: 3.15rem;
-			transform: translateX(-50%);
-			display: grid;
-			gap: 0.05rem;
-			min-width: 6.8rem;
-			padding: 0.5rem 0.64rem;
-			border: 1px solid rgba(214, 223, 208, 0.95);
-			border-radius: 12px;
-			background: rgba(255, 255, 255, 0.96);
-			box-shadow: 0 8px 22px rgba(29, 39, 26, 0.12);
-			pointer-events: none;
-			color: #263121;
-		}
-
-	.profile-tooltip strong {
-		font-size: 0.92rem;
-	}
-
-	.profile-tooltip span {
-		font-size: 0.76rem;
-		color: #63705b;
-	}
-
-		.profile-meta-grid {
-			grid-template-columns: repeat(3, minmax(0, 1fr));
-		}
-
-		.profile-helper {
-			margin: 0;
-			padding: 0 0.15rem;
-			color: var(--ui-muted);
-			font-size: 0.82rem;
-			line-height: 1.42;
-		}
 
 	.download-section {
 		padding: 0.2rem 0 0;
@@ -5487,6 +5293,19 @@
 				bottom: 2.8rem;
 			}
 
+			:global(.maplibregl-ctrl-bottom-right) {
+				bottom: 4.15rem;
+			}
+
+			.map-shell.terrain-open :global(.maplibregl-ctrl-bottom-right),
+			.map-shell.tools-open :global(.maplibregl-ctrl-bottom-right),
+			.map-shell.trail-open :global(.maplibregl-ctrl-bottom-right) {
+				top: 4.6rem;
+				right: 4.5rem;
+				max-width: calc(100% - 5.25rem);
+				bottom: auto;
+			}
+
 			.search-dock {
 				top: 0.75rem;
 				left: 0.75rem;
@@ -5536,18 +5355,19 @@
 				bottom: 0.75rem;
 				width: auto;
 				max-height: 58vh;
+				max-height: 58dvh;
 			}
 
 		.meta-grid,
-		.profile-meta-grid,
 		.surface-list,
 		.format-list {
 			grid-template-columns: 1fr;
 		}
 
-			.stats {
-				grid-template-columns: repeat(2, minmax(0, 1fr));
-			}
+			.stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+			.stats div { padding: .65rem .4rem; }
+			.stats strong { font-size: .78rem; }
+			.stats span { font-size: .6rem; }
 
 		.feature-actions {
 			grid-template-columns: 1fr;
