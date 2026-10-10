@@ -77,7 +77,7 @@
 		setSlopeVisible
 	} from './terrain-layers';
 	import { TerrainControls, LayersPanel } from './components/controls';
-	import { TrailDetailPanel, FeaturePanel, SearchPanel } from './components/sidebar';
+	import { TrailDetailPanel, FeaturePanel, SearchPanel, RouteChooser } from './components/sidebar';
 	import { MapControls, Map3DView } from './components/map';
 
 	const INITIAL_CENTER: [number, number] = [77.18, 32.24];
@@ -3376,43 +3376,14 @@
 		{/if}
 	</div>
 
-	{#if routeChoices.length > 1 && routeChooserPosition}
-		<div
-			class="route-chooser"
-			style={`left:${routeChooserPosition.x}px;top:${routeChooserPosition.y}px;`}
-		>
-			<div class="route-chooser-header">
-				<h3>Routes here</h3>
-				<button class="route-chooser-close" onclick={clearRouteChoices} aria-label="Close route choices">×</button>
-			</div>
-			<p class="route-chooser-note">
-				Multiple trails share this section. Pick the specific route you want to inspect.
-			</p>
-			<div class="route-choice-list">
-				{#each routeChoices as choice}
-					<button
-						class:preview={hoveredRouteChoiceId === choice.id}
-						class="route-choice"
-						onmouseenter={() => previewRouteChoice(choice.id)}
-						onmouseleave={() => previewRouteChoice(null)}
-						onfocus={() => previewRouteChoice(choice.id)}
-						onblur={() => previewRouteChoice(null)}
-						onclick={() => loadTrail(choice.id)}
-					>
-						{#if choice.tag}
-							<span class="route-tag">{choice.tag}</span>
-						{/if}
-						<div>
-							<strong>{choice.name}</strong>
-							{#if choice.network}
-								<p>{choice.network}</p>
-							{/if}
-						</div>
-					</button>
-				{/each}
-			</div>
-		</div>
-	{/if}
+	<RouteChooser
+		choices={routeChoices}
+		position={routeChooserPosition}
+		hoveredId={hoveredRouteChoiceId}
+		onClose={clearRouteChoices}
+		onHover={previewRouteChoice}
+		onSelect={loadTrail}
+	/>
 
 	<FeaturePanel
 		selectedFeature={selectedMapFeature}
