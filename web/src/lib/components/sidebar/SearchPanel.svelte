@@ -40,17 +40,6 @@
 		onSelectResult,
 		onReset
 	}: Props = $props();
-
-	let searchInput: HTMLInputElement;
-
-	function handleInput(e: Event) {
-		const value = (e.target as HTMLInputElement).value;
-		onSearch?.(value);
-	}
-
-	function handleResultClick(result: SearchResult) {
-		onSelectResult?.(result);
-	}
 </script>
 
 <div class:panel-open={detailPanelOpen} class="search-dock">
@@ -94,8 +83,6 @@
 									class:active={searchResults[activeSearchIndex]?.id === result.id}
 									class="search-result"
 									type="button"
-									onmouseenter={() => { /* handled by parent */ }}
-									onfocus={() => { /* handled by parent */ }}
 									onclick={() => onSelectResult?.(result)}
 								>
 									<div class="search-result-topline">
@@ -122,8 +109,6 @@
 									class:active={searchResults[activeSearchIndex]?.id === result.id}
 									class="search-result"
 									type="button"
-									onmouseenter={() => { /* handled by parent */ }}
-									onfocus={() => { /* handled by parent */ }}
 									onclick={() => onSelectResult?.(result)}
 								>
 									<div class="search-result-topline">
@@ -137,7 +122,7 @@
 										{/if}
 									</div>
 									<strong>{result.name}</strong>
-									{#if result.breadcrumb.length > 0}
+									{#if result.breadcrumb?.length > 0}
 										<p>{result.breadcrumb.join(', ')}</p>
 									{/if}
 								</button>
@@ -151,145 +136,185 @@
 </div>
 
 <style>
-	.search-panel {
-		display: flex;
-		flex-direction: column;
-		gap: 1rem;
+	.search-dock {
+		position: absolute;
+		top: 20px;
+		left: 20px;
+		z-index: 15;
+		pointer-events: none;
 	}
 
-	.search-input-wrapper {
+	.search-dock.panel-open {
+		left: 0;
+		right: 0;
+		top: 0;
+		bottom: 0;
+		background: rgba(0, 0, 0, 0.3);
+		pointer-events: auto;
+	}
+
+	.search-card {
 		position: relative;
-		display: flex;
-		align-items: center;
-	}
-
-	.search-input {
-		width: 100%;
-		padding: 0.75rem 1rem 0.75rem 2.75rem;
-		border: 2px solid v-bind('OUTDOOR_THEME.border');
-		border-radius: 6px;
-		background: white;
-		font-size: 0.95rem;
-		color: v-bind('OUTDOOR_THEME.ink.strong');
+		width: 360px;
+		background: rgba(250, 247, 238, 0.96);
+		border: 1px solid rgba(0, 0, 0, 0.08);
+		border-radius: 8px;
+		box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+		pointer-events: auto;
 		transition: all 0.2s ease;
 	}
 
-	.search-input::placeholder {
-		color: v-bind('OUTDOOR_THEME.ink.light');
+	.search-card.open {
+		border-radius: 8px 8px 0 0;
+		box-shadow: 0 8px 16px rgba(0, 0, 0, 0.12);
 	}
 
-	.search-input:focus {
+	.search-input-wrap {
+		position: relative;
+		display: flex;
+		align-items: center;
+		padding: 12px 16px;
+		border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+	}
+
+	.search-icon {
+		position: absolute;
+		left: 16px;
+		font-size: 1.2rem;
+		color: rgba(0, 0, 0, 0.4);
+		pointer-events: none;
+	}
+
+	.search-input {
+		flex: 1;
+		padding: 8px 12px 8px 36px;
+		border: none;
+		background: transparent;
+		font-size: 0.95rem;
+		color: rgba(0, 0, 0, 0.8);
 		outline: none;
-		border-color: v-bind('OUTDOOR_THEME.brand');
-		box-shadow: 0 0 0 3px rgba(46, 102, 83, 0.1);
+		font-family: inherit;
+	}
+
+	.search-input::placeholder {
+		color: rgba(0, 0, 0, 0.4);
 	}
 
 	.search-input:disabled {
-		background: rgba(250, 247, 238, 0.6);
+		opacity: 0.6;
 		cursor: not-allowed;
 	}
 
-	.search-icon,
-	.search-spinner {
-		position: absolute;
-		left: 0.75rem;
-		font-size: 1rem;
+	.search-clear {
+		background: none;
+		border: none;
+		padding: 4px 8px;
+		font-size: 1.5rem;
+		color: rgba(0, 0, 0, 0.4);
+		cursor: pointer;
+		transition: color 0.2s;
 	}
 
-	.search-spinner {
-		display: inline-block;
-		width: 1rem;
-		height: 1rem;
-		border: 2px solid rgba(46, 102, 83, 0.2);
-		border-top-color: v-bind('OUTDOOR_THEME.brand');
-		border-radius: 50%;
-		animation: spin 0.6s linear infinite;
-	}
-
-	@keyframes spin {
-		to {
-			transform: rotate(360deg);
-		}
+	.search-clear:hover {
+		color: rgba(0, 0, 0, 0.7);
 	}
 
 	.search-results {
+		max-height: 480px;
+		overflow-y: auto;
+		border-top: 1px solid rgba(0, 0, 0, 0.06);
+	}
+
+	.search-hint,
+	.search-error {
+		padding: 16px;
+		margin: 0;
+		text-align: center;
+		font-size: 0.9rem;
+		color: rgba(0, 0, 0, 0.5);
+	}
+
+	.search-error {
+		color: #c62828;
+		background: rgba(198, 40, 40, 0.05);
+	}
+
+	.search-result-list {
 		display: flex;
 		flex-direction: column;
-		gap: 0.5rem;
-		max-height: 400px;
-		overflow-y: auto;
 	}
 
-	.results-header {
-		padding: 0 0.5rem;
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-	}
-
-	.results-count {
+	.search-group-label {
+		padding: 8px 16px;
 		font-size: 0.75rem;
 		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
-		color: v-bind('OUTDOOR_THEME.ink.medium');
+		color: rgba(0, 0, 0, 0.4);
+		border-top: 1px solid rgba(0, 0, 0, 0.06);
+		margin-top: 8px;
 	}
 
-	.results-list {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 0.25rem;
-	}
-
-	.result-item {
-		margin: 0;
-	}
-
-	.result-button {
-		width: 100%;
-		padding: 0.75rem;
-		border: 1px solid rgba(0, 0, 0, 0.08);
-		border-radius: 6px;
-		background: rgba(250, 247, 238, 0.95);
-		color: inherit;
+	.search-result {
+		padding: 12px 16px;
+		border: none;
+		background: transparent;
 		text-align: left;
 		cursor: pointer;
-		transition: all 0.2s ease;
+		transition: background 0.2s;
+		border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+		color: inherit;
+		font-family: inherit;
 	}
 
-	.result-button:hover {
+	.search-result:hover,
+	.search-result.active {
 		background: rgba(46, 102, 83, 0.08);
-		border-color: v-bind('OUTDOOR_THEME.brand');
-		transform: translateX(2px);
 	}
 
-	.result-name {
-		font-weight: 600;
-		color: v-bind('OUTDOOR_THEME.ink.strong');
-		margin-bottom: 0.25rem;
-		font-size: 0.95rem;
-	}
-
-	.result-details {
+	.search-result-topline {
 		display: flex;
-		gap: 1rem;
+		gap: 8px;
+		align-items: center;
+		margin-bottom: 4px;
 		font-size: 0.8rem;
-		color: v-bind('OUTDOOR_THEME.ink.medium');
 	}
 
-	.result-region,
-	.result-elevation,
-	.result-distance {
+	.search-kind-pill {
 		display: inline-block;
+		padding: 2px 6px;
+		background: rgba(46, 102, 83, 0.15);
+		color: rgba(46, 102, 83, 0.8);
+		border-radius: 3px;
+		font-weight: 500;
+		font-size: 0.7rem;
+		text-transform: uppercase;
 	}
 
-	.search-empty {
-		padding: 2rem 1rem;
-		text-align: center;
-		color: v-bind('OUTDOOR_THEME.ink.light');
-		font-size: 0.875rem;
+	.search-kind-pill.region-pill {
+		background: rgba(66, 133, 244, 0.15);
+		color: rgba(66, 133, 244, 0.8);
+	}
+
+	.search-network,
+	.search-distance {
+		font-size: 0.8rem;
+		color: rgba(0, 0, 0, 0.5);
+	}
+
+	.search-result strong {
+		display: block;
+		font-weight: 600;
+		color: rgba(0, 0, 0, 0.8);
+		margin-bottom: 2px;
+	}
+
+	.search-result p {
+		margin: 0;
+		font-size: 0.8rem;
+		color: rgba(0, 0, 0, 0.5);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 </style>
