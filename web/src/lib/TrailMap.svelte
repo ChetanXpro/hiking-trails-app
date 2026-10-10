@@ -77,7 +77,7 @@
 		setSlopeVisible
 	} from './terrain-layers';
 	import { TerrainControls, LayersPanel } from './components/controls';
-	import { TrailDetailPanel } from './components/sidebar';
+	import { TrailDetailPanel, FeaturePanel } from './components/sidebar';
 	import { MapControls, Map3DView } from './components/map';
 
 	const INITIAL_CENTER: [number, number] = [77.18, 32.24];
@@ -3492,438 +3492,45 @@
 		</div>
 	{/if}
 
-	{#if selectedMapFeature}
-		<aside class="trail-panel feature-panel" aria-label={`${selectedMapFeature.title} details`}>
-			<button class="close" onclick={closePanel} aria-label="Close location panel">×</button>
-			<p class="breadcrumb">{selectedMapFeature.sourceLabel}</p>
-
-			<div class="hero">
-				<p class="eyebrow">{selectedMapFeature.kindLabel}</p>
-				<h2>{selectedMapFeature.title}</h2>
-				<p class="summary">
-					{selectedMapFeature.source === 'marked_location'
-						? 'Terrain and current conditions for the point you selected.'
-						: 'Mapped outdoor information and current conditions at this location.'}
-				</p>
-			</div>
-
-			<div class="stats feature-stats" aria-live="polite">
-				<div>
-					<span>Elevation</span>
-					<strong>
-						{selectedFeatureElevationStatus === 'loading'
-							? 'Sampling…'
-							: selectedMapFeature.elevationM == null
-								? '—'
-								: formatElevation(selectedMapFeature.elevationM)}
-					</strong>
-					{#if selectedMapFeature.elevationSource}
-						<small>{selectedMapFeature.elevationSource === 'mapped' ? 'Mapped elevation' : 'Merged terrain DEM'}</small>
-					{/if}
-				</div>
-				<div>
-					<span>Coordinates</span>
-					<strong>{featureCoordinateLabel(selectedMapFeature)}</strong>
-					<small>Latitude, longitude</small>
-				</div>
-			</div>
-
-			<div class="trail-quick-actions feature-actions" aria-label="Location actions">
-				<button type="button" onclick={centerSelectedMapFeature}><span>◎</span>Center</button>
-				<button type="button" onclick={copySelectedCoordinates}>
-					<span>⧉</span>{coordinateCopyStatus === 'copied' ? 'Copied' : coordinateCopyStatus === 'error' ? 'Copy failed' : 'Copy coordinates'}
-				</button>
-				<a href={openStreetMapUrl(selectedMapFeature)} target="_blank" rel="noreferrer">
-					<span>↗</span>Open in OSM
-				</a>
-			</div>
-
-			<WeatherSummary
-				forecast={weatherForecast}
-				status={weatherStatus}
-				error={weatherError}
-				title="Current weather"
-				compact={true}
-				onrefresh={() => refreshWeather(selectedMapFeature?.coordinates ?? undefined, true)}
-			/>
-
-			<section class="section">
-				<h3>Location details</h3>
-				<div class="meta-grid">
-					<div class="meta-card">
-						<span>Feature</span>
-						<strong>{selectedMapFeature.kindLabel}</strong>
-					</div>
-					<div class="meta-card">
-						<span>Source</span>
-						<strong>{selectedMapFeature.source === 'marked_location' ? 'Map selection' : 'OpenStreetMap'}</strong>
-					</div>
-					{#if selectedMapFeature.osmType && selectedMapFeature.osmId != null}
-						<div class="meta-card meta-card-wide">
-							<span>OSM object</span>
-							<strong>{selectedMapFeature.osmType === 'N' ? 'Node' : selectedMapFeature.osmType === 'W' ? 'Way' : 'Relation'} {selectedMapFeature.osmId}</strong>
-							<p>OpenStreetMap contributors maintain this public feature.</p>
-						</div>
-					{/if}
-				</div>
-			</section>
-
-			{#if nearbyMapFeatures.length > 0 || nearbyTrailChoices.length > 0}
-				<section class="section">
-					<h3>Also here</h3>
-					<div class="nearby-feature-list">
-						{#each nearbyMapFeatures as feature}
-							<button type="button" class="nearby-feature" onclick={() => selectNearbyMapFeature(feature)}>
-								<span>{feature.kindLabel}</span>
-								<strong>{feature.title}</strong>
-							</button>
-						{/each}
-						{#each nearbyTrailChoices as trail}
-							<button type="button" class="nearby-feature" onclick={() => loadTrail(trail.id)}>
-								<span>Trail</span>
-								<strong>{trail.name}</strong>
-								{#if trail.network}<small>{trail.network}</small>{/if}
-							</button>
-						{/each}
-					</div>
-				</section>
-			{/if}
-		</aside>
-	{/if}
+	<FeaturePanel
+		selectedFeature={selectedMapFeature}
+		weatherForecast={weatherForecast}
+		weatherStatus={weatherStatus}
+		weatherError={weatherError}
+		nearbyFeatures={nearbyMapFeatures}
+		nearbyTrails={nearbyTrailChoices}
+		coordinateCopyStatus={coordinateCopyStatus}
+		onClose={closePanel}
+		onCenter={centerSelectedMapFeature}
+		onCopyCoordinates={copySelectedCoordinates}
+		onSelectNearby={selectNearbyMapFeature}
+		onLoadTrail={(id) => loadTrail(id)}
+		onRefreshWeather={(coords) => refreshWeather(coords ?? undefined, true)}
+	/>
 
 	{#if selectedTrail || detailError}
-		<aside class="trail-panel">
-			<button class="close" onclick={closePanel} aria-label="Close trail panel">×</button>
-
-			{#if detailError}
-				<p class="error">{detailError}</p>
-			{:else if selectedTrail}
-				{#if selectedTrail.region_breadcrumb.length > 0}
-					<p class="breadcrumb">{selectedTrail.region_breadcrumb.join(' › ')}</p>
-				{/if}
-
-				<div class="hero">
-					<p class="eyebrow">
-						{difficultyLabel(selectedTrail.difficulty)} · {hikeTypeLabel(selectedTrail.hike_type)}
-
-					</p>
-					<h2>{selectedTrail.name ?? 'Unnamed trail'}</h2>
-					{#if selectedTrail.summary}
-						<p class="summary">{selectedTrail.summary}</p>
-					{/if}
-				</div>
-
-				<div class="stats">
-					<div>
-						<span>Length</span>
-						<strong>{formatDistance(selectedTrail.distance_m)}</strong>
-					</div>
-					<div>
-						<span>Ascent</span>
-						<strong>{formatElevation(selectedTrail.ascent_m)}</strong>
-					</div>
-					<div>
-						<span>Descent</span>
-						<strong>{formatElevation(selectedTrail.descent_m)}</strong>
-					</div>
-					<div>
-						<span>Est. time</span>
-						<strong title={formatDuration(selectedTrail.estimated_duration_min)}>{formatDuration(selectedTrail.estimated_duration_min).replaceAll(' hr', 'h').replaceAll(' min', 'm')}</strong>
-					</div>
-				</div>
-
-				{#if incompleteRoute}
-					<div class="route-quality" role="note"><strong>Partial route</strong><p>The source has disconnected or missing sections. The line, distance, profile and download cover only the reconstructed portion.</p></div>
-				{/if}
-
-				<div class="trail-quick-actions" aria-label="Trail actions">
-					<button type="button" onclick={fitToSelectedTrail}><span>◎</span>Center</button>
-					<button type="button" onclick={shareTrail}><span>↗</span>Share</button>
-					<button type="button" onclick={() => downloadRoute('gpx')} disabled={downloadBusy}><span>⇩</span>{downloadBusy ? 'Preparing…' : 'Export GPX'}</button>
-				</div>
-
-				{#if shareMessage}<p class="share-status" role="status">{shareMessage}</p>{/if}
-				{#if shareFallback}<input class="share-link" aria-label="Share link" readonly value={shareFallback} onfocus={event => event.currentTarget.select()} />{/if}
-				{#if downloadError}<p class="download-error" role="alert">{downloadError}</p>{/if}
-				<section class="section elevation-section">
-					{#if elevationStatus === 'ready' && elevationProfile}
-						<ElevationChart points={elevationProfile.profile_points} onpreview={point => { elevationHoverPosM = point?.pos_m ?? null; elevationHoverEleM = point?.ele_m ?? null; }} />
-					{:else if elevationStatus === 'loading'}<p class="analysis-note">Loading elevation…</p>
-					{:else if elevationStatus === 'error'}<p class="analysis-note">Couldn’t load elevation. Reload the route to try again.</p><button type="button" onclick={() => selectedTrail && loadTrail(selectedTrail.id, false, false)}>Reload route</button>
-					{:else}<p class="analysis-note">Elevation is unavailable for this route.</p>{/if}
-					<p class="analysis-note">Distances follow the mapped route. Time estimates exclude breaks and changing trail conditions.</p>
-				</section>
-				<p class="source-credit">Map data © OpenStreetMap contributors{#if selectedTrail.original_mapper_name}. Route first added by {#if originalMapperProfileUrl(selectedTrail)}<a href={originalMapperProfileUrl(selectedTrail)} target="_blank" rel="noreferrer">{selectedTrail.original_mapper_name}</a>{:else}{selectedTrail.original_mapper_name}{/if}{/if}. <a href={`https://www.openstreetmap.org/relation/${selectedTrail.osm_relation_id}`} target="_blank" rel="noreferrer">View source route ↗</a></p>
-
-				{#if selectedTrail.cautions?.length}
-					<section class="section">
-						<h3>Access & trail notes</h3>
-						<ul class="caution-list">{#each selectedTrail.cautions as caution}<li>{caution.message} <a href={caution.source_url} target="_blank" rel="noreferrer">Source ↗</a></li>{/each}</ul>
-					</section>
-				{/if}
-				{#if selectedTrail.waypoints.length}
-					<details class="section waypoint-section">
-						<summary>Near the route · {selectedTrail.waypoints.length} mapped places</summary>
-						<p class="analysis-note">Within 150 m of the mapped line; a place may require a detour. A mapped water source does not confirm drinking-water quality.</p>
-						<div class="waypoint-list">{#each selectedTrail.waypoints as waypoint}
-							<button type="button" disabled={waypoint.longitude == null || waypoint.latitude == null} onclick={() => showWaypoint(waypoint)}><span><strong>{waypoint.name ?? surfaceLabel(waypoint.kind)}</strong><small>{surfaceLabel(waypoint.kind)}{waypoint.elevation_m != null ? ` · ${Math.round(waypoint.elevation_m)} m` : ''}</small></span><span aria-hidden="true">◎</span></button>
-						{/each}</div>
-					</details>
-				{/if}
-				<details class="section weather-section"><summary>Trailhead weather</summary>
-
-				<WeatherSummary
-					forecast={weatherForecast}
-					status={weatherStatus}
-					error={weatherError}
-					title="Trailhead weather"
-					compact={true}
-					onrefresh={() => refreshWeather(selectedTrail?.start_point?.coordinates ?? undefined, true)}
-				/>
-
-				</details>
-
-				{#if selectedTrail.features.length > 0}
-					<section class="section">
-						<h3>What to expect</h3>
-						<div class="chips">
-							{#each selectedTrail.features as feature}
-								<span class="chip">{featureLabel(feature)}</span>
-							{/each}
-						</div>
-					</section>
-				{/if}
-
-				{#if selectedTrail.route_from || selectedTrail.route_to || selectedTrail.route_via || selectedTrail.website_url || selectedTrail.video_url || (qaMode && (selectedTrail.route_tag || selectedTrail.network_type || selectedTrail.direction_source))}
-					<section class="section">
-						<h3>Route details</h3>
-						<div class="meta-grid">
-							{#if selectedTrail.route_from || selectedTrail.route_to}
-								<div class="meta-card meta-card-wide">
-									<span>Route path</span>
-									<strong>{directionLabel('forward', selectedTrail)}</strong>
-								</div>
-							{/if}
-							{#if qaMode && selectedTrail.route_tag}
-								<div class="meta-card">
-									<span>Route tag</span>
-									<strong>{selectedTrail.route_tag}</strong>
-								</div>
-							{/if}
-							{#if qaMode && selectedTrail.network_type}
-								<div class="meta-card">
-									<span>Network type</span>
-									<strong>{selectedTrail.network_type}</strong>
-								</div>
-							{/if}
-							{#if qaMode && selectedTrail.direction_source}
-								<div class="meta-card">
-									<span>Direction basis</span>
-									<strong>{directionSourceLabel(selectedTrail.direction_source)}</strong>
-								</div>
-							{/if}
-							{#if normalizeExternalUrl(selectedTrail.website_url)}
-								<div class="meta-card meta-card-wide">
-									<span>Website</span>
-									<a class="meta-link" href={normalizeExternalUrl(selectedTrail.website_url)} target="_blank" rel="noreferrer">
-										{normalizeExternalUrl(selectedTrail.website_url)}
-									</a>
-								</div>
-							{/if}
-							{#if normalizeExternalUrl(selectedTrail.video_url)}
-								<div class="meta-card meta-card-wide">
-									<span>Video</span>
-									<a class="meta-link" href={normalizeExternalUrl(selectedTrail.video_url)} target="_blank" rel="noreferrer">
-										{normalizeExternalUrl(selectedTrail.video_url)}
-									</a>
-								</div>
-							{/if}
-						</div>
-					</section>
-				{/if}
-
-				<section class="section download-section">
-					<button
-						class="section-toggle"
-						type="button"
-						aria-expanded={downloadSectionOpen}
-						onclick={toggleDownloadSection}
-					>
-						<span class="section-title">Download route</span>
-						<span class:open={downloadSectionOpen}>⌄</span>
-					</button>
-
-					{#if downloadSectionOpen}
-						<p class="analysis-note">
-							Choose an export format and travel direction. White chevrons on the blue route preview forward or reverse travel; two-way routes stay uncluttered.
-						</p>
-
-						<div class="download-fieldset">
-							<span class="fieldset-label">Format</span>
-							<div class="radio-list format-list">
-								<label>
-									<input type="radio" bind:group={downloadFormat} value="gpx" />
-									<span>GPX</span>
-								</label>
-								<label>
-									<input type="radio" bind:group={downloadFormat} value="kml" />
-									<span>KML</span>
-								</label>
-								<label>
-									<input type="radio" bind:group={downloadFormat} value="geojson" />
-									<span>GeoJSON</span>
-								</label>
-							</div>
-						</div>
-
-						<div class="download-fieldset">
-							<span class="fieldset-label">Include ways in direction</span>
-							<div class="radio-list direction-list">
-								<label>
-									<input
-										type="radio"
-										name="direction"
-										checked={directionMode === 'forward'}
-										onchange={() => setDirection('forward')}
-									/>
-									<div>
-										<strong>forwards</strong>
-										<p>{directionLabel('forward', selectedTrail)}</p>
-									</div>
-								</label>
-								<label>
-									<input
-										type="radio"
-										name="direction"
-										checked={directionMode === 'backward'}
-										onchange={() => setDirection('backward')}
-									/>
-									<div>
-										<strong>backwards</strong>
-										<p>{directionLabel('backward', selectedTrail)}</p>
-									</div>
-								</label>
-								<label>
-									<input
-										type="radio"
-										name="direction"
-										checked={directionMode === 'both'}
-										onchange={() => setDirection('both')}
-									/>
-									<div>
-										<strong>both</strong>
-										<p>{directionLabel('both', selectedTrail)}</p>
-									</div>
-								</label>
-							</div>
-						</div>
-
-						<button class="download-button" type="button" disabled={downloadBusy} onclick={() => downloadRoute()}>
-							{downloadBusy ? 'Preparing file…' : 'Get file'}
-						</button>
-
-						{#if downloadError}
-							<p class="download-error">{downloadError}</p>
-						{/if}
-					{/if}
-				</section>
-
-				{#if qaMode && (selectedTrail.start_point || selectedTrail.end_point || selectedTrail.stitch_warnings.length > 0)}
-					<section class="section">
-						<h3>Analyze relation</h3>
-						<p class="analysis-note">
-							This route was reconstructed from OSM relation members. Markers and warnings highlight places where the computed path may need review.
-						</p>
-						<div class="analysis-list">
-							{#if selectedTrail.start_point}
-								<div class="analysis-item">
-									<span class="dot start-dot"></span>
-									<div>
-										<strong>Start point</strong>
-										<p>Green start marker on the map. Open Download route to preview high-contrast direction chevrons from here.</p>
-									</div>
-								</div>
-							{/if}
-							{#if selectedTrail.end_point}
-								<div class="analysis-item">
-									<span class="dot end-dot"></span>
-									<div>
-										<strong>Finish point</strong>
-										<p>The dark Finish marker separates the endpoint from the red route network and blue selected route.</p>
-									</div>
-								</div>
-							{/if}
-							{#if diagnosticCount('branch') > 0}
-								<div class="analysis-item">
-									<span class="dot branch-dot"></span>
-									<div>
-										<strong>{diagnosticCount('branch')} branch point{diagnosticCount('branch') === 1 ? '' : 's'}</strong>
-										<p>Blue markers show junctions where more than two route segments meet.</p>
-									</div>
-								</div>
-							{/if}
-							{#if diagnosticCount('open_end') > 0}
-								<div class="analysis-item">
-									<span class="dot warning-dot"></span>
-									<div>
-										<strong>{diagnosticCount('open_end')} open end{diagnosticCount('open_end') === 1 ? '' : 's'}</strong>
-										<p>These points mark route ends where the computed path does not continue.</p>
-									</div>
-								</div>
-							{/if}
-							{#if diagnosticCount('disconnected') > 0}
-								<div class="analysis-item">
-									<span class="dot disconnected-dot"></span>
-									<div>
-										<strong>{diagnosticCount('disconnected')} disconnected point{diagnosticCount('disconnected') === 1 ? '' : 's'}</strong>
-										<p>Gray markers show broken-off pieces that were not part of the main stitched path.</p>
-									</div>
-								</div>
-							{/if}
-							{#each warningSummaries(selectedTrail.stitch_warnings) as summary}
-								<div class="analysis-item warning-item">
-									<span class="dot warning-dot"></span>
-									<div>
-										<strong>
-											{summary.title}
-											{#if summary.count > 1}
-												<span class="count-pill">{summary.count}</span>
-											{/if}
-										</strong>
-										<p>{summary.description}</p>
-									</div>
-								</div>
-							{/each}
-						</div>
-					</section>
-				{/if}
-
-				{#if selectedTrail.surfaces.length > 0}
-					<section class="section">
-						<h3>Surfaces</h3>
-						<div class="surface-bar">
-							{#each selectedTrail.surfaces as surface}
-								<div
-									class="surface-segment"
-									style={`width:${surface.pct}%;background:${surfaceColor(surface.surface_type)}`}
-								></div>
-							{/each}
-						</div>
-						<div class="surface-list">
-							{#each selectedTrail.surfaces as surface}
-								<div class="surface-item">
-									<span class="dot" style={`background:${surfaceColor(surface.surface_type)}`}></span>
-									<div>
-										<strong>{surfaceLabel(surface.surface_type)}</strong>
-										<p>{surface.pct.toFixed(0)}% · {formatDistance(surface.distance_m)}</p>
-									</div>
-								</div>
-							{/each}
-						</div>
-					</section>
-				{/if}
-			{/if}
-		</aside>
+		<TrailDetailPanel
+			selectedTrail={selectedTrail}
+			incompleteRoute={incompleteRoute}
+			downloadBusy={downloadBusy}
+			shareMessage={shareMessage}
+			shareFallback={shareFallback}
+			downloadError={downloadError}
+			elevationStatus={elevationStatus}
+			elevationProfile={elevationProfile}
+			weatherForecast={weatherForecast}
+			weatherStatus={weatherStatus}
+			weatherError={weatherError}
+			detailError={detailError}
+			onClose={closePanel}
+			onCenter={fitToSelectedTrail}
+			onShare={shareTrail}
+			onExportGPX={() => downloadRoute("gpx")}
+			onReloadRoute={() => selectedTrail && loadTrail(selectedTrail.id, false, false)}
+			onShowWaypoint={showWaypoint}
+			onRefreshWeather={(coords) => refreshWeather(coords ?? undefined, true)}
+			onElevationHover={(point) => { elevationHoverPosM = point?.pos_m ?? null; elevationHoverEleM = point?.ele_m ?? null; }}
+		/>
 	{/if}
 </div>
 

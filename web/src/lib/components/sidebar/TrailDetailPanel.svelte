@@ -5,6 +5,7 @@
 
 	interface Props {
 		selectedTrail: TrailDetail | null;
+		detailError?: string | null;
 		incompleteRoute: boolean;
 		downloadBusy: boolean;
 		shareMessage: string | null;
@@ -35,6 +36,7 @@
 
 	let {
 		selectedTrail = null,
+		detailError = null,
 		incompleteRoute = false,
 		downloadBusy = false,
 		shareMessage = null,
@@ -57,10 +59,12 @@
 	}: Props = $props();
 </script>
 
-<aside class="trail-panel" hidden={!selectedTrail}>
+<aside class="trail-panel" hidden={!selectedTrail && !detailError}>
 	<button class="close" onclick={onClose} aria-label="Close trail panel">×</button>
 
-	{#if selectedTrail}
+	{#if detailError}
+		<p class="error">{detailError}</p>
+	{:else if selectedTrail}
 		{#if selectedTrail.region_breadcrumb.length > 0}
 			<p class="breadcrumb">{selectedTrail.region_breadcrumb.join(' › ')}</p>
 		{/if}
