@@ -78,7 +78,7 @@
 	} from './terrain-layers';
 	import { TerrainControls, LayersPanel } from './components/controls';
 	import { TrailDetailPanel, FeaturePanel, SearchPanel, RouteChooser } from './components/sidebar';
-	import { MapControls, Map3DView } from './components/map';
+	import { MapControls, Map3DView, MapLoadingCard } from './components/map';
 
 	const INITIAL_CENTER: [number, number] = [77.18, 32.24];
 	const INITIAL_ZOOM = 9;
@@ -3263,26 +3263,7 @@
 		class="map"
 		aria-busy={!mapVisualReady}
 	></div>
-	<div
-		class:ready={mapVisualReady}
-		class="map-loading"
-		role="status"
-		aria-hidden={mapVisualReady}
-		aria-live="polite"
-	>
-		<div class="map-loading-card">
-			{#if mapLoadError}
-				<span class="map-loading-mark error" aria-hidden="true">!</span>
-				<strong>Outdoor map did not finish loading</strong>
-				<span>{mapLoadError}</span>
-				<button type="button" onclick={() => window.location.reload()}>Try again</button>
-			{:else}
-				<span class="map-loading-mark" aria-hidden="true">△</span>
-				<strong>Preparing outdoor map</strong>
-				<span>Terrain, trails and elevation</span>
-			{/if}
-		</div>
-	</div>
+	<MapLoadingCard isReady={mapVisualReady} error={mapLoadError} />
 
 	<SearchPanel
 		query={searchQuery}
