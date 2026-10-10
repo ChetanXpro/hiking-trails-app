@@ -18,7 +18,6 @@
 local srid = 4326
 
 local raw_ways = osm2pgsql.define_way_table('raw_ways', {
-    { column = 'osm_id', type = 'bigint', not_null = true },
     { column = 'tags',   type = 'jsonb', not_null = true },
     { column = 'geom',   type = 'linestring', projection = srid, not_null = true },
 })
@@ -149,6 +148,30 @@ local function insert_point_features(object, point)
     end
 end
 
+local function is_main_route_member_role(role)
+    return role == nil or role == '' or role == 'forward' or role == 'backward'
+end
+
+-- Flex stage 1 sees ways before it sees their relations. Mark the supported
+-- members of ordinary hiking routes for stage-2 reprocessing so an untagged
+-- connector, bridge outline, or other legitimate non-highway member is still
+-- available to the stitcher. This is much smaller than retaining every way in
+-- the regional PBF.
+function osm2pgsql.select_relation_members(relation)
+    if relation.tags.type ~= 'route' or relation.tags.route ~= 'hiking' then
+        return
+    end
+
+    local ways = {}
+    for _, member in ipairs(relation.members) do
+        if member.type == 'w' and is_main_route_member_role(member.role) then
+            table.insert(ways, member.ref)
+        end
+    end
+
+    return { ways = ways }
+end
+
 function osm2pgsql.process_node(object)
     insert_point_features(object, object:as_point())
 end
@@ -163,9 +186,8 @@ function osm2pgsql.process_way(object)
     -- members in addition to classic `path`/`track` ways. If we prune
     -- too early here, the stitcher never even sees those relation
     -- members and the final route becomes artificially shorter.
-    if object.tags.highway then
+    if object.tags.highway or osm2pgsql.stage == 2 then
         raw_ways:insert({
-            osm_id = object.id,
             tags = object.tags,
             geom = object:as_linestring(),
         })
@@ -178,7 +200,11 @@ function osm2pgsql.process_relation(object)
         insert_point_features(object, object:as_multipolygon():centroid())
     end
 
-    if object.tags.route == 'hiking' then
+    -- State extracts deliberately stage ordinary routes only. Completing and
+    -- publishing a country-scale superroute from one intersecting state would
+    -- create misleading coverage and unnecessary storage; national imports
+    -- can opt into those through a dedicated full-country pipeline later.
+    if object.tags.type == 'route' and object.tags.route == 'hiking' then
         local members = {}
         for _, member in ipairs(object.members) do
             table.insert(members, {

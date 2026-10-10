@@ -6,6 +6,8 @@
  * released in ranked tiers, with the full local inventory reserved for z17+.
  */
 
+import { APP_POI_ICON_NAMES } from './outdoor-poi-icons';
+
 export type CustomOutdoorPoiTier = {
 	id: string;
 	minzoom: number;
@@ -37,7 +39,7 @@ export const CUSTOM_OUTDOOR_POI_TIERS: readonly CustomOutdoorPoiTier[] = [
 			'first_aid_kit',
 			'defibrillator'
 		],
-		icon: 'hospital',
+		icon: APP_POI_ICON_NAMES.emergency,
 		priority: 0
 	},
 	{
@@ -45,7 +47,7 @@ export const CUSTOM_OUTDOOR_POI_TIERS: readonly CustomOutdoorPoiTier[] = [
 		minzoom: 10.5,
 		labelMinzoom: 11.5,
 		kinds: ['alpine_hut', 'wilderness_hut', 'basic_hut'],
-		icon: 'lodging',
+		icon: APP_POI_ICON_NAMES.overnight,
 		priority: 10
 	},
 	{
@@ -53,7 +55,7 @@ export const CUSTOM_OUTDOOR_POI_TIERS: readonly CustomOutdoorPoiTier[] = [
 		minzoom: 12.5,
 		labelMinzoom: 13.5,
 		kinds: ['hospital', 'clinic'],
-		icon: 'hospital',
+		icon: APP_POI_ICON_NAMES.medical,
 		priority: 15
 	},
 	{
@@ -61,7 +63,7 @@ export const CUSTOM_OUTDOOR_POI_TIERS: readonly CustomOutdoorPoiTier[] = [
 		minzoom: 11.5,
 		labelMinzoom: 12.5,
 		kinds: ['drinking_water'],
-		icon: 'attraction',
+		icon: APP_POI_ICON_NAMES.water,
 		priority: 20
 	},
 	{
@@ -69,7 +71,7 @@ export const CUSTOM_OUTDOOR_POI_TIERS: readonly CustomOutdoorPoiTier[] = [
 		minzoom: 11.5,
 		labelMinzoom: 12.5,
 		kinds: ['trailhead'],
-		icon: 'park',
+		icon: APP_POI_ICON_NAMES.trailhead,
 		priority: 30
 	},
 	{
@@ -77,7 +79,7 @@ export const CUSTOM_OUTDOOR_POI_TIERS: readonly CustomOutdoorPoiTier[] = [
 		minzoom: 11.5,
 		labelMinzoom: 13,
 		kinds: ['camp_site'],
-		icon: 'campsite',
+		icon: APP_POI_ICON_NAMES.camp,
 		priority: 40
 	},
 	{
@@ -85,7 +87,7 @@ export const CUSTOM_OUTDOOR_POI_TIERS: readonly CustomOutdoorPoiTier[] = [
 		minzoom: 13.5,
 		labelMinzoom: 15,
 		kinds: ['spring'],
-		icon: 'attraction',
+		icon: APP_POI_ICON_NAMES.spring,
 		priority: 60
 	},
 	{
@@ -93,7 +95,7 @@ export const CUSTOM_OUTDOOR_POI_TIERS: readonly CustomOutdoorPoiTier[] = [
 		minzoom: 13,
 		labelMinzoom: 14.5,
 		kinds: ['weather_shelter', 'lean_to', 'rock_shelter', 'shelter'],
-		icon: 'lodging',
+		icon: APP_POI_ICON_NAMES.shelter,
 		priority: 65
 	},
 	{
@@ -115,7 +117,7 @@ export const CUSTOM_OUTDOOR_POI_TIERS: readonly CustomOutdoorPoiTier[] = [
 			'picnic_site',
 			'aerialway_station'
 		],
-		icon: 'attraction',
+		icon: APP_POI_ICON_NAMES.local,
 		priority: 70
 	}
 ] as const;

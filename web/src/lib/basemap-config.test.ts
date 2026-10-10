@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
 	absolutizeBasemapStyleResources,
+	buildOsmDerivedVectorSource,
 	DEFAULT_BASEMAP_STYLE_URL,
 	findFirstLabelAnchor,
 	findTerrainOverlayAnchor,
 	normalizeBasemapStyleUrl,
 	prepareOutdoorBasemapStyle,
+	OSM_DATA_ATTRIBUTION,
 	resolveTerrainOverlayAnchor,
 	shouldHideBasemapLayer,
 	terrainBasemapPaintOverrides,
@@ -17,6 +19,13 @@ describe('basemap-config', () => {
 	it('defaults to the vector basemap when unset', () => {
 		expect(normalizeBasemapStyleUrl(undefined)).toBe(DEFAULT_BASEMAP_STYLE_URL);
 		expect(normalizeBasemapStyleUrl('')).toBe(DEFAULT_BASEMAP_STYLE_URL);
+	});
+
+	it('attributes app-owned OSM trail and waypoint vector sources independently of the basemap', () => {
+		const source = buildOsmDerivedVectorSource('/trail_lines/{z}/{x}/{y}');
+		expect(source.tiles).toEqual(['/trail_lines/{z}/{x}/{y}']);
+		expect(source.attribution).toBe(OSM_DATA_ATTRIBUTION);
+		expect(source.attribution).toContain('openstreetmap.org/copyright');
 	});
 
 	it('allows explicit raster fallback tokens', () => {
@@ -133,12 +142,16 @@ describe('basemap-config', () => {
 		const style: MutableBasemapStyle = prepareOutdoorBasemapStyle({
 			layers: [
 				{ id: 'landcover_wood', type: 'fill', 'source-layer': 'landcover', paint: {} },
-				{ id: 'provider-hillshade', type: 'hillshade', paint: {} }
+				{ id: 'provider-hillshade', type: 'hillshade', paint: {} },
+				{ id: 'poi_r7', type: 'symbol', 'source-layer': 'poi', layout: {} },
+				{ id: 'mountain-peak', type: 'symbol', 'source-layer': 'mountain_peak', layout: {} }
 			]
 		});
 
 		expect(style.layers[0].paint?.['fill-color']).toBe(OUTDOOR_THEME.surface.forest);
 		expect(style.layers[1].layout?.visibility).toBe('none');
+		expect(style.layers[2].layout?.visibility).toBe('none');
+		expect(style.layers[3].layout?.visibility).toBe('none');
 	});
 
 	it('does not assign paint properties to an incompatible custom layer type', () => {

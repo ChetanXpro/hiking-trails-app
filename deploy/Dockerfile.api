@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.96.0-bookworm AS build
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN --mount=type=cache,id=hiking-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=hiking-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=hiking-api-target,target=/app/target \
+    cargo build --locked --release -p hiking-api && \
+    install -Dm755 target/release/hiking-api /out/hiking-api
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 10001 app && \
+    useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
+
+COPY --from=build /out/hiking-api /usr/local/bin/hiking-api
+
+USER app
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/hiking-api"]

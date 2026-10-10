@@ -12,12 +12,17 @@ import {
 	DEFAULT_TERRAIN_RGB_URL,
 	HILLSHADE_EXAGGERATION,
 	isModernMapLibreVersion,
+	MIN_CONTOUR_LABEL_ZOOM,
 	MIN_CONTOUR_ZOOM,
+	MIN_INTERMEDIATE_CONTOUR_ZOOM,
+	MIN_MINOR_CONTOUR_ZOOM,
 	MIN_TERRAIN_ZOOM,
 	normalizeTerrainEncoding,
 	normalizeTerrainBounds,
+	normalizeTerrainMaxZoom,
 	normalizeTerrainTileSize,
-	resolveMapLibreVersion
+	resolveMapLibreVersion,
+	terrainCacheSizeForDevice
 } from './terrain-config';
 
 /** Evaluate a MapLibre `['interpolate', ['linear'], ['zoom'], z, v, ...]` at `zoom`. */
@@ -70,6 +75,23 @@ describe('terrain-config', () => {
 		expect(normalizeTerrainTileSize(undefined)).toBe(512);
 	});
 
+	it('bounds DEM caches for memory-constrained hiking devices', () => {
+		expect(terrainCacheSizeForDevice({ deviceMemoryGb: 2 })).toBe(16);
+		expect(terrainCacheSizeForDevice({ deviceMemoryGb: 4 })).toBe(24);
+		expect(terrainCacheSizeForDevice({ mobile: true, deviceMemoryGb: 8 })).toBe(24);
+		expect(terrainCacheSizeForDevice({ deviceMemoryGb: 8 })).toBe(64);
+		expect(terrainCacheSizeForDevice()).toBe(48);
+	});
+
+	it('clamps configured terrain zooms to MapLibre-safe integer bounds', () => {
+		expect(normalizeTerrainMaxZoom(undefined)).toBe(13);
+		expect(normalizeTerrainMaxZoom('14')).toBe(14);
+		expect(normalizeTerrainMaxZoom('14.9')).toBe(14);
+		expect(normalizeTerrainMaxZoom('-20')).toBe(6);
+		expect(normalizeTerrainMaxZoom('999')).toBe(22);
+		expect(normalizeTerrainMaxZoom('not-a-number', 12)).toBe(12);
+	});
+
 	it('builds contour options with feet conversion and smooth overzoom defaults', () => {
 		const options = buildContourTileOptions('feet');
 		expect(options.multiplier).toBeCloseTo(3.28084, 5);
@@ -92,6 +114,11 @@ describe('terrain-config', () => {
 	});
 
 	it('reports the intervals hikers are seeing at fractional zooms', () => {
+		expect(contourIntervalsAtZoom('meters', 7.8)).toEqual({
+			minor: 500,
+			intermediate: 1000,
+			index: 2000
+		});
 		expect(contourIntervalsAtZoom('meters', 14.3)).toEqual({
 			minor: 20,
 			intermediate: 40,
@@ -104,8 +131,11 @@ describe('terrain-config', () => {
 		});
 	});
 
-	it('roughly doubles mid-zoom contour density while guarding steep low zoom', () => {
-		// z9-10 stay coarse so steep Himalayan relief does not collapse to bands.
+	it('adds a sparse regional hierarchy and keeps detailed low zoom guarded', () => {
+		// Regional zooms generate a broad hierarchy, while the style shows only
+		// its index level until z8 so steep relief does not collapse to bands.
+		expect(CONTOUR_THRESHOLDS[7]).toEqual([500, 1000, 2000]);
+		expect(CONTOUR_THRESHOLDS[8]).toEqual([250, 500, 1000]);
 		expect(CONTOUR_THRESHOLDS[9]).toEqual([250, 500, 1000]);
 		expect(CONTOUR_THRESHOLDS[10]).toEqual([100, 200, 500]);
 		// z11-12 are the terrain-reading band and are ~2x denser than before.
@@ -161,18 +191,22 @@ describe('terrain-config', () => {
 	it('keeps meter contours on the intended physical intervals', () => {
 		const options = buildContourTileOptions('meters');
 		expect(options.thresholds).toEqual(CONTOUR_THRESHOLDS);
+		expect(options.thresholds[7]).toEqual([500, 1000, 2000]);
 		expect(options.thresholds[14]).toEqual([20, 40, 100]);
 		expect(options.thresholds[16]).toEqual([10, 20, 50]);
-		expect(MIN_CONTOUR_ZOOM).toBe(9);
+		expect(MIN_CONTOUR_ZOOM).toBe(7);
+		expect(MIN_CONTOUR_LABEL_ZOOM).toBe(7);
+		expect(MIN_INTERMEDIATE_CONTOUR_ZOOM).toBe(8);
+		expect(MIN_MINOR_CONTOUR_ZOOM).toBe(9);
 	});
 
 	it('uses outdoor-map label density and readable scale progression', () => {
 		expect(CONTOUR_THRESHOLDS[10]).toEqual([100, 200, 500]);
 		expect(CONTOUR_LABEL_SPACING).toEqual(
-			expect.arrayContaining([9, 640, 12, 320, 14, 210, 16, 145])
+			expect.arrayContaining([7, 900, 8, 760, 9, 640, 12, 320, 14, 210, 16, 145])
 		);
 		expect(CONTOUR_LABEL_SIZE).toEqual(
-			expect.arrayContaining([9, 10, 12, 11, 14, 12, 16, 13])
+			expect.arrayContaining([7, 9, 8, 9.5, 9, 10, 12, 11, 14, 12, 16, 13])
 		);
 	});
 

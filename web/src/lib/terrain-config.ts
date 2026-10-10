@@ -3,12 +3,37 @@ export type TerrainEncoding = 'mapbox' | 'terrarium';
 export type TerrainTileSize = 256 | 512;
 export type TerrainBounds = [number, number, number, number];
 
+export type TerrainDeviceProfile = {
+	deviceMemoryGb?: number;
+	mobile?: boolean;
+};
+
 export const DEFAULT_TERRAIN_RGB_URL = '/terrain_rgb_hma/{z}/{x}/{y}';
 export const DEFAULT_TERRAIN_BOUNDS: TerrainBounds = [75, 30, 79, 34];
 export const DEFAULT_TERRAIN_ATTRIBUTION =
 	'<a href="https://nsidc.org/data/hma_dem8m_at/versions/1">HMA DEM</a> · <a href="https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM">Copernicus DEM</a>';
 export const MIN_TERRAIN_ZOOM = 6;
-export const MIN_CONTOUR_ZOOM = 9;
+export const MAX_TERRAIN_ZOOM = 22;
+export const DEFAULT_TERRAIN_MAX_ZOOM = 13;
+export const MIN_CONTOUR_ZOOM = 7;
+export const MIN_CONTOUR_LABEL_ZOOM = 6;
+export const MIN_INTERMEDIATE_CONTOUR_ZOOM = 8;
+export const MIN_MINOR_CONTOUR_ZOOM = 9;
+
+/**
+ * maplibre-contour keeps raw, parsed, and generated-tile caches, so a cache of
+ * 128 512px DEM tiles can consume hundreds of megabytes. Keep enough nearby
+ * tiles for smooth panning while respecting memory-constrained hiking phones.
+ */
+export function terrainCacheSizeForDevice({
+	deviceMemoryGb,
+	mobile = false
+}: TerrainDeviceProfile = {}): number {
+	if (deviceMemoryGb != null && deviceMemoryGb <= 2) return 16;
+	if (mobile || (deviceMemoryGb != null && deviceMemoryGb <= 4)) return 24;
+	if (deviceMemoryGb != null && deviceMemoryGb >= 8) return 64;
+	return 48;
+}
 
 export const HYPSO_STOPS: Array<[number, string]> = [
 	[0, '#B8CBAF'],
@@ -26,14 +51,16 @@ export const HYPSO_STOPS: Array<[number, string]> = [
 /**
  * Contour intervals [minor, intermediate, index] in meters, by zoom.
  *
- * The mid-zoom band (z11–12) is roughly twice as dense as before so the
- * linework carries real texture where terrain-reading happens. z9–10 stay
- * coarse on purpose: in steep Himalayan relief a finer interval there collapses
- * into solid brown bands. z13+ already sit at a fine 20 m minor, so they are
- * left alone to avoid the same mush when zoomed in. Index lines stay a wide
- * multiple of the minor so the bold hierarchy reads even when dense.
+ * At regional zooms only the index hierarchy is drawn: 2,000 m at z7 and
+ * 1,000 m at z8. Intermediate lines join at z8 and detailed minor lines at z9,
+ * preventing steep Himalayan relief from collapsing into solid brown bands.
+ * z7 is the safe floor because smooth contour generation samples the z6 DEM;
+ * the current Terrain-RGB pyramid does not contain z5. The mid-zoom band
+ * (z11–12) carries denser terrain-reading texture.
  */
 export const CONTOUR_THRESHOLDS: Record<number, number[]> = {
+	7: [500, 1000, 2000],
+	8: [250, 500, 1000],
 	9: [250, 500, 1000],
 	10: [100, 200, 500],
 	11: [50, 100, 250],
@@ -53,46 +80,60 @@ export const CONTOUR_LABEL_SPACING: unknown[] = [
 	'interpolate',
 	['linear'],
 	['zoom'],
+	7,
+	1200,
+	8,
+	1000,
 	9,
-	640,
+	850,
 	10,
-	520,
+	700,
 	11,
-	420,
+	580,
 	12,
-	320,
+	460,
 	13,
-	255,
+	380,
 	14,
-	210,
+	320,
 	15,
-	175,
+	280,
 	16,
-	145
+	240
 ];
 
 export const CONTOUR_LABEL_SIZE: unknown[] = [
 	'interpolate',
 	['linear'],
 	['zoom'],
-	9,
-	10,
-	11,
-	10.5,
-	12,
-	11,
+	6,
 	13,
-	11.5,
+	7,
 	14,
-	12,
+	8,
 	15,
-	12.5,
+	9,
 	16,
-	13
+	10,
+	17,
+	11,
+	18,
+	12,
+	19,
+	13,
+	20,
+	14,
+	21,
+	15,
+	22,
+	16,
+	23
 ];
 
-/** Imperial mirror of {@link CONTOUR_THRESHOLDS}; same mid-zoom densification. */
+/** Imperial mirror of {@link CONTOUR_THRESHOLDS}; rounded to readable intervals. */
 export const CONTOUR_THRESHOLDS_FEET: Record<number, number[]> = {
+	7: [2500, 5000, 10000],
+	8: [1000, 2000, 4000],
 	9: [1000, 2000, 4000],
 	10: [500, 1000, 2500],
 	11: [100, 200, 500],
@@ -141,25 +182,25 @@ export const HILLSHADE_EXAGGERATION: unknown[] = [
 	['linear'],
 	['zoom'],
 	6,
-	0.3,
+	0.4,
 	9,
-	0.44,
+	0.55,
 	11,
-	0.58,
+	0.73,
 	12.5,
-	0.62,
+	0.78,
 	14,
-	0.6,
+	0.75,
 	15,
-	0.52,
+	0.65,
 	16,
-	0.42,
+	0.53,
 	17,
-	0.32,
+	0.4,
 	18,
-	0.22,
+	0.28,
 	19,
-	0.12,
+	0.15,
 	20,
 	0.05
 ];
@@ -176,6 +217,23 @@ export function normalizeTerrainTileSize(value?: number | string | null): Terrai
 				? Number.parseInt(value, 10)
 				: Number.NaN;
 	return parsed === 256 ? 256 : 512;
+}
+
+export function normalizeTerrainMaxZoom(
+	value?: number | string | null,
+	fallback = DEFAULT_TERRAIN_MAX_ZOOM
+): number {
+	const parsed =
+		typeof value === 'number'
+			? value
+			: typeof value === 'string' && value.trim()
+				? Number(value)
+				: Number.NaN;
+	const safeFallback = Number.isFinite(fallback)
+		? Math.min(MAX_TERRAIN_ZOOM, Math.max(MIN_TERRAIN_ZOOM, Math.trunc(fallback)))
+		: DEFAULT_TERRAIN_MAX_ZOOM;
+	if (!Number.isFinite(parsed)) return safeFallback;
+	return Math.min(MAX_TERRAIN_ZOOM, Math.max(MIN_TERRAIN_ZOOM, Math.trunc(parsed)));
 }
 
 export function normalizeTerrainBounds(

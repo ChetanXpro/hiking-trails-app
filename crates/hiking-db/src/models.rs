@@ -27,7 +27,7 @@ pub struct Region {
     pub osm_relation_id: Option<i64>,
     pub name: String,
     pub admin_level: Option<i16>,
-    pub country_code: String,
+    pub country_code: Option<String>,
     pub parent_region_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -181,4 +181,26 @@ pub async fn fetch_trail_with_geometry(
     let geom = geom_bytes.map(|b| decode_wkb(&b)).transpose()?;
 
     Ok((trail, geom))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_deserializes_a_missing_country_code() {
+        let region: Region = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(),
+            "osm_relation_id": null,
+            "name": "Unknown region",
+            "admin_level": null,
+            "country_code": null,
+            "parent_region_id": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("deserialize nullable country code");
+
+        assert_eq!(region.country_code, None);
+    }
 }

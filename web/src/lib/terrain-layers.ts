@@ -8,9 +8,15 @@ import {
 	CONTOUR_LABEL_SPACING,
 	DEFAULT_TERRAIN_RGB_URL,
 	HILLSHADE_EXAGGERATION,
+	MIN_CONTOUR_LABEL_ZOOM,
+	MIN_CONTOUR_ZOOM,
+	MIN_INTERMEDIATE_CONTOUR_ZOOM,
+	MIN_MINOR_CONTOUR_ZOOM,
 	MIN_TERRAIN_ZOOM,
 	normalizeTerrainEncoding,
+	normalizeTerrainMaxZoom,
 	normalizeTerrainTileSize,
+	terrainCacheSizeForDevice,
 	type ContourUnit,
 	type TerrainBounds,
 	type TerrainEncoding,
@@ -19,11 +25,12 @@ import {
 	resolveMapLibreVersion
 } from './terrain-config';
 import {
-	renderSlopeTileImageData,
+	buildPaddedElevationGrid,
 	SLOPE_MIN_ZOOM,
 	type ElevationGrid,
 	type ElevationNeighborhood
 } from './slope-config';
+import { createSlopeWorkerPool, type SlopeWorkerPool } from './slope-worker-client';
 import { OUTDOOR_THEME } from './outdoor-theme';
 
 const TERRAIN_SOURCE_ID = 'terrain-dem';
@@ -42,11 +49,10 @@ const DEFAULT_MAX_ZOOM = 13;
 let slopeProtocolCounter = 0;
 
 const PALETTE = {
-	// A deep, cool slate — dark enough to give valleys and shaded faces real
-	// punch without collapsing to the black blobs that would swallow the trails
-	// drawn on top of the hillshade.
-	shadowBase: '28, 38, 35',
-	highlightBase: '255, 250, 232',
+	// Richer, darker slate for dramatic hillshade with clear ridge/valley definition.
+	// Dark enough to show terrain drama without obscuring trails.
+	shadowBase: '18, 24, 22',
+	highlightBase: '255, 250, 240',
 	contourMinor: OUTDOOR_THEME.contour.minor,
 	contourIntermediate: OUTDOOR_THEME.contour.intermediate,
 	contourIndex: OUTDOOR_THEME.contour.index,
@@ -58,6 +64,7 @@ type ContourDemSource = InstanceType<typeof mlcontour.DemSource>;
 
 type TerrainRuntime = {
 	demSource: ContourDemSource;
+	demConfigKey: string;
 	surfaceAnchorId?: string;
 	labelAnchorId?: string;
 	contourUnit: ContourUnit;
@@ -69,6 +76,7 @@ type TerrainRuntime = {
 	exaggeration: number;
 	modern: boolean;
 	slopeProtocol?: string;
+	slopeWorkerPool?: SlopeWorkerPool;
 	slopeMaxzoom: number;
 	slopeTileSize: TerrainTileSize;
 	slopeOpacity: number;
@@ -106,6 +114,56 @@ export type TerrainLayerOptions = {
 
 const runtimes = new WeakMap<maplibregl.Map, TerrainRuntime>();
 
+type TerrainGlobal = typeof globalThis & {
+	__hikingSharedDemSources?: Map<string, ContourDemSource>;
+};
+
+function terrainDeviceCacheSize(): number {
+	if (typeof navigator === 'undefined') return terrainCacheSizeForDevice();
+	const deviceMemoryGb = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+	const mobile =
+		(typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) ||
+		(typeof window !== 'undefined' && window.innerWidth <= 740);
+	return terrainCacheSizeForDevice({ deviceMemoryGb, mobile });
+}
+
+function sharedDemSource(
+	url: string,
+	encoding: TerrainEncoding,
+	maxzoom: number,
+	cacheSize: number,
+	key = sharedDemSourceKey(url, encoding, maxzoom, cacheSize)
+): ContourDemSource {
+	const terrainGlobal = globalThis as TerrainGlobal;
+	const registry = (terrainGlobal.__hikingSharedDemSources ??= new Map());
+	const existing = registry.get(key);
+	if (existing) return existing;
+
+	const source = new mlcontour.DemSource({
+		url,
+		encoding,
+		maxzoom,
+		worker: true,
+		cacheSize,
+		timeoutMs: 12000
+	});
+	// maplibre-contour does not currently expose manager disposal. Register one
+	// source per immutable configuration and reuse it across map remounts instead
+	// of leaking a new worker-side manager and protocol pair on every navigation.
+	source.setupMaplibre(maplibregl);
+	registry.set(key, source);
+	return source;
+}
+
+function sharedDemSourceKey(
+	url: string,
+	encoding: TerrainEncoding,
+	maxzoom: number,
+	cacheSize: number
+): string {
+	return JSON.stringify([url, encoding, maxzoom, cacheSize]);
+}
+
 function detectModern(force?: boolean): boolean {
 	if (typeof force === 'boolean') return force;
 	return isModernMapLibreVersion(
@@ -120,25 +178,25 @@ export function addTerrainLayers(
 	const demUrl = options.demUrl ?? options.terrainRgbUrl ?? DEFAULT_TERRAIN_RGB_URL;
 	const encoding = normalizeTerrainEncoding(options.encoding);
 	const tileSize = normalizeTerrainTileSize(options.tileSize);
-	const maxzoom = options.maxzoom ?? DEFAULT_MAX_ZOOM;
+	const maxzoom = normalizeTerrainMaxZoom(options.maxzoom, DEFAULT_MAX_ZOOM);
 	const surfaceAnchorId = options.surfaceAnchorId ?? options.lineAnchorId ?? options.beforeLayerId;
 	const labelAnchorId = options.labelAnchorId;
 	const modern = detectModern(options.forceModern);
+	const cacheSize = terrainDeviceCacheSize();
+	const sharedDemKey = sharedDemSourceKey(demUrl, encoding, maxzoom, cacheSize);
+	const demConfigKey = JSON.stringify([
+		sharedDemKey,
+		tileSize,
+		options.bounds,
+		options.attribution ?? null,
+		modern
+	]);
 
 	let runtime = runtimes.get(map);
 	if (!runtime) {
-		const demSource = new mlcontour.DemSource({
-			url: demUrl,
-			encoding,
-			maxzoom,
-			worker: true,
-			cacheSize: 128,
-			timeoutMs: 12000
-		});
-		demSource.setupMaplibre(maplibregl);
-
 		runtime = {
-			demSource,
+			demSource: sharedDemSource(demUrl, encoding, maxzoom, cacheSize, sharedDemKey),
+			demConfigKey,
 			surfaceAnchorId,
 			labelAnchorId,
 			contourUnit: options.contourUnit ?? 'meters',
@@ -157,6 +215,9 @@ export function addTerrainLayers(
 		runtime.slopeProtocol = registerSlopeProtocol(map, runtime);
 		runtimes.set(map, runtime);
 	} else {
+		if (runtime.demConfigKey !== demConfigKey) {
+			throw new Error('Terrain source configuration changed after map initialization');
+		}
 		runtime.surfaceAnchorId = surfaceAnchorId;
 		runtime.labelAnchorId = labelAnchorId;
 		runtime.bounds = options.bounds;
@@ -199,21 +260,21 @@ export function addTerrainLayers(
 
 export function setHillshadeVisible(map: maplibregl.Map, visible: boolean): void {
 	const runtime = runtimes.get(map);
-	if (!runtime) return;
+	if (!runtime || runtime.hillshadeVisible === visible) return;
 	runtime.hillshadeVisible = visible;
 	setLayerVisibility(map, HILLSHADE_LAYER_ID, visible);
 }
 
 export function setColorReliefVisible(map: maplibregl.Map, visible: boolean): void {
 	const runtime = runtimes.get(map);
-	if (!runtime) return;
+	if (!runtime || runtime.colorReliefVisible === visible) return;
 	runtime.colorReliefVisible = visible;
 	setLayerVisibility(map, COLOR_RELIEF_LAYER_ID, visible);
 }
 
 export function setSlopeVisible(map: maplibregl.Map, visible: boolean): void {
 	const runtime = runtimes.get(map);
-	if (!runtime) return;
+	if (!runtime || runtime.slopeVisible === visible) return;
 	runtime.slopeVisible = visible;
 	setLayerVisibility(map, SLOPE_LAYER_ID, visible);
 }
@@ -221,7 +282,9 @@ export function setSlopeVisible(map: maplibregl.Map, visible: boolean): void {
 export function setSlopeOpacity(map: maplibregl.Map, opacity: number): void {
 	const runtime = runtimes.get(map);
 	if (!runtime) return;
-	runtime.slopeOpacity = clampUnit(opacity);
+	const nextOpacity = clampUnit(opacity);
+	if (runtime.slopeOpacity === nextOpacity) return;
+	runtime.slopeOpacity = nextOpacity;
 	if (map.getLayer(SLOPE_LAYER_ID)) {
 		map.setPaintProperty(
 			SLOPE_LAYER_ID,
@@ -233,7 +296,7 @@ export function setSlopeOpacity(map: maplibregl.Map, opacity: number): void {
 
 export function setContoursVisible(map: maplibregl.Map, visible: boolean): void {
 	const runtime = runtimes.get(map);
-	if (!runtime) return;
+	if (!runtime || runtime.contoursVisible === visible) return;
 	runtime.contoursVisible = visible;
 	for (const layerId of contourLayerIds()) {
 		setLayerVisibility(map, layerId, visible);
@@ -254,6 +317,12 @@ export function set3DTerrainEnabled(
 ): void {
 	const runtime = runtimes.get(map);
 	if (!runtime) return;
+	if (
+		runtime.terrainEnabled === enabled &&
+		(typeof exaggeration !== 'number' || runtime.exaggeration === exaggeration)
+	) {
+		return;
+	}
 	runtime.terrainEnabled = enabled;
 	if (typeof exaggeration === 'number') runtime.exaggeration = exaggeration;
 	applyTerrainState(map, runtime);
@@ -261,7 +330,7 @@ export function set3DTerrainEnabled(
 
 export function setTerrainExaggeration(map: maplibregl.Map, exaggeration: number): void {
 	const runtime = runtimes.get(map);
-	if (!runtime) return;
+	if (!runtime || runtime.exaggeration === exaggeration) return;
 	runtime.exaggeration = exaggeration;
 	if (runtime.terrainEnabled) {
 		map.setTerrain({ source: TERRAIN_SOURCE_ID, exaggeration });
@@ -269,8 +338,8 @@ export function setTerrainExaggeration(map: maplibregl.Map, exaggeration: number
 }
 
 export function enableAlpineView(map: maplibregl.Map): void {
-	map.setMaxPitch(85);
-	map.easeTo({ pitch: 62, duration: 900 });
+	map.setMaxPitch(60);
+	map.easeTo({ pitch: 55, duration: 900 });
 }
 
 /**
@@ -458,8 +527,10 @@ function ensureHillshadeLayer(map: maplibregl.Map, runtime: TerrainRuntime) {
 
 function supportsSlopeOverlay(): boolean {
 	return (
+		typeof Worker !== 'undefined' &&
 		typeof OffscreenCanvas !== 'undefined' &&
 		typeof ImageData !== 'undefined' &&
+		typeof OffscreenCanvas.prototype.convertToBlob === 'function' &&
 		typeof (maplibregl as unknown as { addProtocol?: unknown }).addProtocol === 'function'
 	);
 }
@@ -468,21 +539,6 @@ function parseSlopeTileUrl(url: string): [number, number, number] {
 	const match = url.match(/\/(\d+)\/(\d+)\/(\d+)(?:\.[a-z]+)?(?:\?.*)?$/i);
 	if (!match) throw new Error(`Invalid slope tile URL: ${url}`);
 	return [Number(match[1]), Number(match[2]), Number(match[3])];
-}
-
-async function encodeSlopePng(
-	rgba: Uint8ClampedArray,
-	width: number,
-	height: number
-): Promise<ArrayBuffer> {
-	const canvas = new OffscreenCanvas(width, height);
-	const ctx = canvas.getContext('2d');
-	if (!ctx) throw new Error('Slope overlay requires a 2D canvas context');
-	const image = new ImageData(width, height);
-	image.data.set(rgba);
-	ctx.putImageData(image, 0, 0);
-	const blob = await canvas.convertToBlob({ type: 'image/png' });
-	return blob.arrayBuffer();
 }
 
 /**
@@ -507,22 +563,51 @@ function registerSlopeProtocol(
 				) => Promise<{ data: ArrayBuffer }>
 			) => void;
 		}
-	).addProtocol;
+		).addProtocol;
+	let workerPool: SlopeWorkerPool;
+	try {
+		workerPool = createSlopeWorkerPool();
+		runtime.slopeWorkerPool = workerPool;
+	} catch (error) {
+		console.warn('Slope overlay worker could not start:', error);
+		return undefined;
+	}
 
-	addProtocol(id, async (params, abortController) => {
-		const [z, x, y] = parseSlopeTileUrl(params.url);
-		const neighborhood = await fetchSlopeNeighborhood(runtime, z, x, y, abortController);
-		const dem = neighborhood[4];
-		if (!dem) throw new Error(`Missing center DEM tile for slope ${z}/${x}/${y}`);
-		const rgba = renderSlopeTileImageData(dem, z, y, neighborhood);
-		const data = await encodeSlopePng(rgba, dem.width, dem.height);
-		return { data };
-	});
+	try {
+		addProtocol(id, async (params, abortController) => {
+			const [z, x, y] = parseSlopeTileUrl(params.url);
+			const neighborhood = await fetchSlopeNeighborhood(runtime, z, x, y, abortController);
+			const dem = neighborhood[4];
+			if (!dem) throw new Error(`Missing center DEM tile for slope ${z}/${x}/${y}`);
+			if (abortController.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+			const padded = buildPaddedElevationGrid(dem, neighborhood);
+			const data = await workerPool.classify(
+				{
+					zoom: z,
+					tileY: y,
+					width: padded.width,
+					height: padded.height,
+					paddedBuffer: padded.data.buffer as ArrayBuffer
+				},
+				abortController.signal
+			);
+			return { data };
+		});
+	} catch (error) {
+		workerPool.dispose();
+		console.warn('Slope overlay protocol could not register:', error);
+		return undefined;
+	}
 
 	const removeProtocol = (maplibregl as unknown as { removeProtocol?: (id: string) => void })
 		.removeProtocol;
 	if (typeof removeProtocol === 'function') {
-		map.once('remove', () => removeProtocol(id));
+		map.once('remove', () => {
+			workerPool.dispose();
+			removeProtocol(id);
+		});
+	} else {
+		map.once('remove', () => workerPool.dispose());
 	}
 	return id;
 }
@@ -641,7 +726,7 @@ function rebuildContourLayers(map: maplibregl.Map, runtime: TerrainRuntime) {
 			type: 'line',
 			source: CONTOUR_SOURCE_ID,
 			'source-layer': 'contours',
-			minzoom: 9,
+			minzoom: MIN_MINOR_CONTOUR_ZOOM,
 			filter: ['==', ['get', 'level'], 0],
 			layout: {
 				visibility,
@@ -649,8 +734,8 @@ function rebuildContourLayers(map: maplibregl.Map, runtime: TerrainRuntime) {
 			},
 			paint: {
 				'line-color': PALETTE.contourMinor,
-				'line-width': ['interpolate', ['linear'], ['zoom'], 9, 0.25, 12, 0.38, 14, 0.48, 16, 0.6],
-				'line-opacity': ['interpolate', ['linear'], ['zoom'], 9, 0.16, 11, 0.22, 14, 0.3, 16, 0.38]
+				'line-width': ['interpolate', ['linear'], ['zoom'], 9, 0.25, 12, 0.34, 14, 0.42, 16, 0.5],
+				'line-opacity': ['interpolate', ['linear'], ['zoom'], 9, 0.14, 11, 0.2, 14, 0.26, 16, 0.32]
 			}
 		},
 		runtime.surfaceAnchorId
@@ -662,7 +747,7 @@ function rebuildContourLayers(map: maplibregl.Map, runtime: TerrainRuntime) {
 			type: 'line',
 			source: CONTOUR_SOURCE_ID,
 			'source-layer': 'contours',
-			minzoom: 9,
+			minzoom: MIN_INTERMEDIATE_CONTOUR_ZOOM,
 			filter: ['==', ['get', 'level'], 1],
 			layout: {
 				visibility,
@@ -670,8 +755,8 @@ function rebuildContourLayers(map: maplibregl.Map, runtime: TerrainRuntime) {
 			},
 			paint: {
 				'line-color': PALETTE.contourIntermediate,
-				'line-width': ['interpolate', ['linear'], ['zoom'], 9, 0.36, 12, 0.55, 14, 0.7, 16, 0.85],
-				'line-opacity': ['interpolate', ['linear'], ['zoom'], 9, 0.28, 11, 0.36, 14, 0.46, 16, 0.54]
+				'line-width': ['interpolate', ['linear'], ['zoom'], 8, 0.24, 9, 0.36, 12, 0.55, 14, 0.7, 16, 0.85],
+				'line-opacity': ['interpolate', ['linear'], ['zoom'], 8, 0.16, 9, 0.28, 11, 0.36, 14, 0.46, 16, 0.54]
 			}
 		},
 		runtime.surfaceAnchorId
@@ -683,7 +768,7 @@ function rebuildContourLayers(map: maplibregl.Map, runtime: TerrainRuntime) {
 			type: 'line',
 			source: CONTOUR_SOURCE_ID,
 			'source-layer': 'contours',
-			minzoom: 9,
+			minzoom: MIN_CONTOUR_ZOOM,
 			filter: ['>=', ['get', 'level'], 2],
 			layout: {
 				visibility,
@@ -691,8 +776,8 @@ function rebuildContourLayers(map: maplibregl.Map, runtime: TerrainRuntime) {
 			},
 			paint: {
 				'line-color': PALETTE.contourIndex,
-				'line-width': ['interpolate', ['linear'], ['zoom'], 9, 0.65, 12, 0.85, 14, 1.08, 16, 1.3],
-				'line-opacity': ['interpolate', ['linear'], ['zoom'], 9, 0.52, 11, 0.62, 14, 0.72, 16, 0.8]
+				'line-width': ['interpolate', ['linear'], ['zoom'], 7, 0.44, 8, 0.54, 9, 0.65, 12, 0.85, 14, 1.08, 16, 1.3],
+				'line-opacity': ['interpolate', ['linear'], ['zoom'], 7, 0.32, 8, 0.42, 9, 0.52, 11, 0.62, 14, 0.72, 16, 0.8]
 			}
 		},
 		runtime.surfaceAnchorId
@@ -705,29 +790,30 @@ function rebuildContourLayers(map: maplibregl.Map, runtime: TerrainRuntime) {
 			source: CONTOUR_SOURCE_ID,
 			'source-layer': 'contours',
 			filter: ['>=', ['get', 'level'], 2],
-			minzoom: 9,
+			minzoom: MIN_CONTOUR_LABEL_ZOOM,
 			layout: {
 				visibility,
 				'symbol-placement': 'line',
 				'symbol-spacing': CONTOUR_LABEL_SPACING as never,
-				'text-field': ['to-string', ['round', ['get', 'ele']]],
+				'text-field': ['concat', ['to-string', ['round', ['get', 'ele']]], ' m'],
 				'text-size': CONTOUR_LABEL_SIZE as never,
 				'text-font': ['Noto Sans Bold'],
-				'text-letter-spacing': 0.01,
-				'text-max-angle': 45,
-				'text-padding': 2,
-				'text-pitch-alignment': 'viewport',
+				'text-letter-spacing': 0.05,
+				'text-max-angle': 60,
+				'text-padding': 3,
+				'text-pitch-alignment': 'map',
 				'text-rotation-alignment': 'map',
 				'text-keep-upright': true,
 				'text-allow-overlap': false,
-				'text-ignore-placement': true
+				'text-ignore-placement': false
 			},
 			paint: {
 				'text-color': PALETTE.contourLabel,
 				'text-halo-color': PALETTE.contourHalo,
-				'text-halo-width': 2,
-				'text-halo-blur': 0.2,
-				'text-opacity': ['interpolate', ['linear'], ['zoom'], 9, 0.78, 11, 0.88, 14, 0.96, 16, 1]
+				'text-halo-width': 3.5,
+				'text-halo-blur': 0.8,
+				'text-opacity': ['interpolate', ['linear'], ['zoom'], 6, 1, 7, 1, 8, 0.95, 9, 0.92, 11, 0.88, 14, 0.90, 16, 0.92, 18, 0.85],
+				'text-offset': [0, -0.5]
 			}
 		},
 		runtime.labelAnchorId
@@ -735,10 +821,18 @@ function rebuildContourLayers(map: maplibregl.Map, runtime: TerrainRuntime) {
 }
 
 function applyTerrainState(map: maplibregl.Map, runtime: TerrainRuntime) {
+	const current = map.getTerrain();
 	if (runtime.terrainEnabled) {
+		if (
+			current?.source === TERRAIN_SOURCE_ID &&
+			current.exaggeration === runtime.exaggeration
+		) {
+			return;
+		}
 		map.setTerrain({ source: TERRAIN_SOURCE_ID, exaggeration: runtime.exaggeration });
 		return;
 	}
+	if (!current) return;
 	map.setTerrain(null);
 }
 

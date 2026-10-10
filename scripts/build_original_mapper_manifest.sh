@@ -121,7 +121,7 @@ if ! awk -v delay="${DELAY_SECONDS}" 'BEGIN { exit !(delay + 0 >= 1.0) }'; then
 fi
 
 RELATION_IDS=()
-relation_ids_output=$(psql "${DATABASE_URL}" -Atc \
+relation_ids_output=$(PGDATABASE="${DATABASE_URL}" psql -Atc \
 	"SELECT osm_relation_id FROM trails ORDER BY osm_relation_id")
 while IFS= read -r relation_id; do
 	[[ -n "${relation_id}" ]] && RELATION_IDS+=("${relation_id}")
@@ -173,6 +173,7 @@ done
 
 NETWORK_REQUESTS=0
 FETCHED=0
+FETCH_FAILED=false
 offset=0
 while [[ ${offset} -lt ${#SELECTED_IDS[@]} ]]; do
 	batch_ids=()
@@ -195,7 +196,10 @@ while [[ ${offset} -lt ${#SELECTED_IDS[@]} ]]; do
 	set +e
 	http_code=$(curl -sS \
 		--connect-timeout 10 \
-		--max-time 30 \
+		--max-time 60 \
+		--retry 4 \
+		--retry-max-time 180 \
+		--fail-with-body \
 		--user-agent "${USER_AGENT}" \
 		--header "Accept: application/json" \
 		--output "${batch_tmp}" \
@@ -205,9 +209,9 @@ while [[ ${offset} -lt ${#SELECTED_IDS[@]} ]]; do
 	set -e
 
 	NETWORK_REQUESTS=$((NETWORK_REQUESTS + 1))
-	FETCHED=$((FETCHED + ${#batch_ids[@]}))
 
 	if [[ "${curl_status}" -eq 0 && "${http_code}" == "200" ]]; then
+		FETCHED=$((FETCHED + ${#batch_ids[@]}))
 		for relation_id in "${batch_ids[@]}"; do
 			tmp_path="${CACHE_DIR}/${relation_id}.json.tmp"
 			if jq -e --argjson relation_id "${relation_id}" '
@@ -245,12 +249,18 @@ while [[ ${offset} -lt ${#SELECTED_IDS[@]} ]]; do
 			echo "A requested version may be unavailable; retry this batch with --batch-size 1." >&2
 		fi
 		echo "Stopping this batch; cached successful responses are preserved." >&2
+		FETCH_FAILED=true
 		break
 	fi
 
 	sleep "${DELAY_SECONDS}"
 	offset=${index}
 done
+
+if [[ "${FETCH_FAILED}" == true ]]; then
+	echo "Manifest was not changed because the requested fetch was incomplete. Re-run to resume from the immutable cache." >&2
+	exit 1
+fi
 
 entries_path=$(mktemp "${TMPDIR:-/tmp}/original-mappers.XXXXXX")
 output_tmp="${OUTPUT_PATH}.tmp"

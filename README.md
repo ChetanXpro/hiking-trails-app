@@ -1,5 +1,8 @@
 # Hiking trails app
 
+For the low-cost single-VPS production stack, R2 artifact workflow, backups,
+and release procedure, see [DEPLOYMENT.md](DEPLOYMENT.md).
+
 A from-scratch hiking trail platform built on free OpenStreetMap data,
 scoped to Himachal Pradesh first but designed to scale to all of India
 or the world without schema changes.
@@ -14,7 +17,7 @@ hiking-trails-app/
 │   ├── hiking-import/       # OSM extraction -> stitching -> trails/segments
 │   └── hiking-api/          # Actix-web API server
 ├── migrations/
-│   └── 0001_init_schema.sql # regions, trails, segments, waypoints, elevation_profiles, sync_state
+│   └── 0001..0017           # forward-only PostgreSQL/PostGIS migrations
 ├── osm2pgsql/
 │   └── trails.lua           # flex-output config: raw staging import from .osm.pbf
 └── web/                     # SvelteKit + MapLibre frontend
@@ -47,12 +50,11 @@ both configured from `.env`.
 ## 2. Apply the schema
 
 ```bash
-sqlx migrate run
+cargo run -p hiking-db --bin hiking-migrate
 ```
 
-`sqlx-cli` reads `DATABASE_URL` straight from `.env` automatically --
-no manual `export` needed. (Install it once: `cargo install sqlx-cli
---no-default-features --features postgres`.)
+The repository-owned migrator reads `DATABASE_URL` from `.env`, applies every
+file in `migrations/`, and avoids requiring a separately installed SQLx CLI.
 
 ## 3. Get the data (Himachal Pradesh scope)
 
@@ -66,7 +68,13 @@ curl -O https://download.geofabrik.de/asia/india-latest.osm.pbf
 
 This script derives the Himachal Pradesh admin boundary directly from
 the local India extract, so you do not need a separately downloaded
-`.poly` file. It writes:
+`.poly` file. It uses Osmium's smart strategy so ordinary hiking routes and
+the polygon relations used for regions/POIs remain reference-complete when
+they cross the state boundary. Country-scale `type=superroute` relations are
+deliberately excluded from state-level trail staging; those belong in a
+future full-country import rather than being published as misleading partial
+routes. It writes:
+
 - `./data/himachal_pradesh.geojson`
 - `./data/hp.osm.pbf`
 - `./data/hp-trails.osm.pbf` (legacy, trails-only filtered extract)
@@ -74,7 +82,9 @@ the local India extract, so you do not need a separately downloaded
 Faster first test with a small bounding box instead of the full HP polygon:
 
 ```bash
-osmium extract -b 77.05,32.15,77.35,32.35 india-latest.osm.pbf -o test.osm.pbf
+osmium extract --strategy smart --option types=route,multipolygon,boundary \
+  --option tags=route=hiking,boundary=administrative,boundary=protected_area \
+  -b 77.05,32.15,77.35,32.35 india-latest.osm.pbf -o test.osm.pbf
 ```
 
 ## 4. Raw import into staging tables
@@ -84,7 +94,7 @@ source .env   # so $DATABASE_URL is set for this shell
 # Flex output reads projection from `osm2pgsql/trails.lua`, so do not pass `-l`.
 # Import the full Himachal extract here so admin boundaries and named places
 # are available for hierarchical search as well as trail stitching.
-osm2pgsql -d "$DATABASE_URL" --slim --output=flex \
+osm2pgsql -d "$DATABASE_URL" --slim --drop --output=flex \
   --style=osm2pgsql/trails.lua \
   ./data/hp.osm.pbf
 ```
@@ -114,7 +124,17 @@ it), and writes ordered rows into `trails` + `segments`.
 The broad `w/highway` extract is intentional. Hiking relations often
 reuse ordinary road segments for short connectors, village approaches,
 or bridge crossings. Filtering to only `path`/`footway`/`track` can
-silently drop legitimate route members and shorten the final trail.
+silently drop legitimate route members and shorten the final trail. The flex
+style also uses osm2pgsql's second-stage relation-member selection to retain
+supported blank/`forward`/`backward` members that do not have `highway=*`,
+without storing every unrelated regional way.
+
+For an authoritative snapshot refresh, set
+`IMPORT_PRUNE_MISSING_TRAILS=true` to remove OSM trails that disappeared or
+became invalid. This is intentionally off by default: pruning runs only after
+the stitching pass has zero reconstruction failures and refuses an empty raw
+snapshot. Region/place pruning is not inferred because those rows do not yet
+carry enough source-scope provenance to delete safely.
 
 ### Optional original OSM mapper attribution
 
@@ -182,32 +202,24 @@ Serves on `:8080`:
 
 ```bash
 cd web
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
 Open **http://localhost:5173**.
 
-## A build-time requirement worth knowing
+## Builds do not need a database
 
-`hiking-api` and `hiking-import` use `sqlx::query_as!`/`sqlx::query!`
-macros, not the runtime-only query API -- these connect to a real,
-migrated Postgres database *while you're compiling*, to verify the SQL
-and Rust types match the actual schema. Practically this means:
-
-- `DATABASE_URL` (from `.env`) must point at a live, migrated database
-  whenever you run `cargo build` / `cargo check`, not just when you run
-  the binaries.
-- For CI, or anywhere a live DB isn't reachable at build time, run
-  `cargo sqlx prepare --workspace` once locally -- this caches the
-  verified query metadata into a `.sqlx/` folder that you commit to
-  git, and sqlx will use that cache instead of a live connection.
+The Rust crates use SQLx's runtime query API, so `cargo build`, `cargo test`,
+and container builds do not connect to PostgreSQL. A database is required only
+when running the migrator, importer, or API. This keeps CI and release image
+builds deterministic and prevents build-time access to production credentials.
 
 ## Everyday dev loop
 
 - `docker compose up -d` / `docker compose down` for infra, once per session
-- `cargo run -p hiking-api`, `npm run dev` -- normal native processes, each in their own terminal tab
-- Change `.env` once, every tool (`sqlx-cli`, `hiking-api`, `hiking-import`, `docker compose`) picks it up the same way -- no more hunting down every place a credential is hardcoded
+- `cargo run -p hiking-api`, `pnpm --dir web dev` -- normal native processes, each in their own terminal tab
+- Change `.env` once; the migrator, API, importer, and Docker Compose read the same local configuration
 
 ## Elevation pipeline
 
@@ -241,8 +253,12 @@ osm2pgsql -d "$DATABASE_URL" --slim --output=flex \
 cargo run -p hiking-import
 ```
 
-- If no DEM path is configured, the importer still works, but elevation
-  profiles and ascent/descent stats are skipped
+- DEM selection is explicit by default. If no DEM path is configured, the
+  importer still works and preserves existing elevation enrichment. Set
+  `DEM_AUTO_DISCOVER=true` only when you intentionally want it to scan
+  `data/dem_tiles`; production keeps this disabled.
+- `ELEVATION_MAX_SAMPLES` bounds raster work per trail (20,000 by default),
+  preventing malformed or exceptionally long routes from exhausting memory.
 
 ## Terrain rendering
 
@@ -252,9 +268,10 @@ profiles.
 
 ### 0. Use a vector basemap
 
-The frontend now defaults to a vector basemap style so labels stay crisp
-above the relief and trail stack instead of being baked into raster OSM
-pixels.
+Development defaults to a vector basemap style so labels stay crisp above the
+relief and trail stack. Production has no hidden public basemap, raster,
+glyph, or weather fallback; configure the runtime `PUBLIC_*` variables in
+`.env.production` as described in [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ```bash
 VITE_BASEMAP_STYLE_URL=https://tiles.openfreemap.org/styles/liberty
@@ -309,11 +326,12 @@ MIN_ZOOM=6 MAX_ZOOM=13 WORKERS=8 \
 
 ### 2. Serve it from Martin
 
-This repo's `docker-compose.yml` now mounts the local `./data`
-directory into the Martin container, so placing
-`./data/terrain_rgb_hma.mbtiles` there is enough. Restart Martin after the
-file exists, and it will auto-discover the MBTiles and serve the tiles
-at:
+This repo's `docker-compose.yml` mounts the local `./data` directory into the
+Martin container. Its entrypoint passes only the tile archives named in its
+allowlist to Martin, so JSON manifests, database dumps, import files, and
+unrelated archives are never mistaken for public tile sources. Placing
+`./data/terrain_rgb_hma.mbtiles` there is enough. Restart Martin after the file
+exists, and it will serve the tiles at:
 
 ```text
 /terrain_rgb_hma/{z}/{x}/{y}
@@ -361,8 +379,8 @@ The same rail also includes:
 
 - map-layer controls for known routes, route names, ordinary paths,
   outdoor POIs, peaks/passes, and region boundaries
-- coordinate-based current weather and five-day forecasts from
-  Open-Meteo
+- coordinate-based current weather and five-day forecasts from the configured
+  provider (Open-Meteo is the development default)
 
 Production/commercial deployments should review Open-Meteo's current
 usage terms and consider proxy caching.
@@ -389,3 +407,6 @@ Notes:
 - User accounts / community content -- out of scope for now
 - SOI licensed data -- phase 2, pending the licensing/entity-type
   question flagged earlier
+
+The hiking-focused discovery, sharing and data-consistency changes are described in
+[App improvements](docs/app-improvements.md), including migrations 0018–0019 and validation.

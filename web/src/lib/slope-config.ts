@@ -78,6 +78,17 @@ export type ElevationGrid = {
 /** Neighbor order: NW, N, NE, W, center, E, SW, S, SE. */
 export type ElevationNeighborhood = readonly (ElevationGrid | undefined)[];
 
+/**
+ * A DEM tile plus the one-pixel border needed by Horn's 3x3 kernel. Keeping
+ * only the border avoids cloning nine complete DEM tiles into the classifier
+ * worker for every requested slope tile.
+ */
+export type PaddedElevationGrid = {
+	width: number;
+	height: number;
+	data: Float32Array;
+};
+
 const MIN_VALID_ELEVATION_M = -12000;
 const MAX_VALID_ELEVATION_M = 9000;
 
@@ -90,36 +101,107 @@ function validElevation(value: number | undefined): value is number {
 	);
 }
 
-function sampleNeighborhood(
-	neighborhood: ElevationNeighborhood,
-	center: ElevationGrid,
-	x: number,
-	y: number
-): number | undefined {
-	const { width, height } = center;
-	let tileX = 0;
-	let tileY = 0;
-	let localX = x;
-	let localY = y;
-	if (x < 0) {
-		tileX = -1;
-		localX += width;
-	} else if (x >= width) {
-		tileX = 1;
-		localX -= width;
-	}
-	if (y < 0) {
-		tileY = -1;
-		localY += height;
-	} else if (y >= height) {
-		tileY = 1;
-		localY -= height;
+function matchingGrid(
+	grid: ElevationGrid | undefined,
+	width: number,
+	height: number
+): ElevationGrid | undefined {
+	return grid?.width === width && grid.height === height ? grid : undefined;
+}
+
+/**
+ * Copies the center tile and only the edge pixels required from its eight
+ * neighbors into a transferable `(width + 2) x (height + 2)` grid.
+ */
+export function buildPaddedElevationGrid(
+	dem: ElevationGrid,
+	neighbors?: ElevationNeighborhood
+): PaddedElevationGrid {
+	const { width, height } = dem;
+	const paddedWidth = width + 2;
+	const paddedHeight = height + 2;
+	const data = new Float32Array(paddedWidth * paddedHeight);
+	data.fill(Number.NaN);
+
+	for (let y = 0; y < height; y += 1) {
+		data.set(dem.data.subarray(y * width, (y + 1) * width), (y + 1) * paddedWidth + 1);
 	}
 
-	const grid = neighborhood[(tileY + 1) * 3 + (tileX + 1)];
-	if (!grid || grid.width !== width || grid.height !== height) return undefined;
-	const value = grid.data[localY * width + localX];
-	return validElevation(value) ? value : undefined;
+	const neighborhood = neighbors ?? [];
+	const north = matchingGrid(neighborhood[1], width, height);
+	const west = matchingGrid(neighborhood[3], width, height);
+	const east = matchingGrid(neighborhood[5], width, height);
+	const south = matchingGrid(neighborhood[7], width, height);
+
+	if (north) {
+		data.set(north.data.subarray((height - 1) * width, height * width), 1);
+	}
+	if (south) {
+		data.set(south.data.subarray(0, width), (height + 1) * paddedWidth + 1);
+	}
+	if (west) {
+		for (let y = 0; y < height; y += 1) {
+			data[(y + 1) * paddedWidth] = west.data[y * width + width - 1];
+		}
+	}
+	if (east) {
+		for (let y = 0; y < height; y += 1) {
+			data[(y + 1) * paddedWidth + width + 1] = east.data[y * width];
+		}
+	}
+
+	const northwest = matchingGrid(neighborhood[0], width, height);
+	const northeast = matchingGrid(neighborhood[2], width, height);
+	const southwest = matchingGrid(neighborhood[6], width, height);
+	const southeast = matchingGrid(neighborhood[8], width, height);
+	if (northwest) data[0] = northwest.data[height * width - 1];
+	if (northeast) data[width + 1] = northeast.data[(height - 1) * width];
+	if (southwest) data[(height + 1) * paddedWidth] = southwest.data[width - 1];
+	if (southeast) data[paddedHeight * paddedWidth - 1] = southeast.data[0];
+
+	return { width, height, data };
+}
+
+/** Classifies a transferable padded DEM grid without accessing map state. */
+export function renderPaddedSlopeTileImageData(
+	padded: PaddedElevationGrid,
+	zoom: number,
+	tileY: number
+): Uint8ClampedArray {
+	const { width, height, data } = padded;
+	const paddedWidth = width + 2;
+	if (width <= 0 || height <= 0 || data.length !== paddedWidth * (height + 2)) {
+		throw new Error('Invalid padded elevation grid');
+	}
+
+	const res = metersPerPixel(zoom, tileCenterLat(tileY, zoom), width);
+	const rgba = new Uint8ClampedArray(width * height * 4);
+	for (let y = 0; y < height; y += 1) {
+		for (let x = 0; x < width; x += 1) {
+			const centerIndex = (y + 1) * paddedWidth + x + 1;
+			const z1 = data[centerIndex - paddedWidth - 1];
+			const z2 = data[centerIndex - paddedWidth];
+			const z3 = data[centerIndex - paddedWidth + 1];
+			const z4 = data[centerIndex - 1];
+			const center = data[centerIndex];
+			const z6 = data[centerIndex + 1];
+			const z7 = data[centerIndex + paddedWidth - 1];
+			const z8 = data[centerIndex + paddedWidth];
+			const z9 = data[centerIndex + paddedWidth + 1];
+			if (![center, z1, z2, z3, z4, z6, z7, z8, z9].every(validElevation)) continue;
+
+			const dzdx = (z3 + 2 * z6 + z9 - (z1 + 2 * z4 + z7)) / (8 * res);
+			const dzdy = (z7 + 2 * z8 + z9 - (z1 + 2 * z2 + z3)) / (8 * res);
+			const angle = (Math.atan(Math.hypot(dzdx, dzdy)) * 180) / Math.PI;
+			const [r, g, b, a] = slopeColorForAngle(angle);
+			const i = (y * width + x) * 4;
+			rgba[i] = r;
+			rgba[i + 1] = g;
+			rgba[i + 2] = b;
+			rgba[i + 3] = Math.round(a * 255);
+		}
+	}
+	return rgba;
 }
 
 /**
@@ -133,44 +215,11 @@ export function renderSlopeTileImageData(
 	tileY: number,
 	neighbors?: ElevationNeighborhood
 ): Uint8ClampedArray {
-	const { width, height } = dem;
-	const res = metersPerPixel(zoom, tileCenterLat(tileY, zoom), width);
-	const rgba = new Uint8ClampedArray(width * height * 4);
 	const neighborhood = neighbors ?? [undefined, undefined, undefined, undefined, dem];
 	if (neighborhood[4] !== dem) {
 		const mutable = [...neighborhood];
 		mutable[4] = dem;
-		return renderSlopeTileImageData(dem, zoom, tileY, mutable);
+		return renderPaddedSlopeTileImageData(buildPaddedElevationGrid(dem, mutable), zoom, tileY);
 	}
-
-	for (let y = 0; y < height; y++) {
-		for (let x = 0; x < width; x++) {
-			const center = sampleNeighborhood(neighborhood, dem, x, y);
-			if (center === undefined) continue;
-			const z1 = sampleNeighborhood(neighborhood, dem, x - 1, y - 1);
-			const z2 = sampleNeighborhood(neighborhood, dem, x, y - 1);
-			const z3 = sampleNeighborhood(neighborhood, dem, x + 1, y - 1);
-			const z4 = sampleNeighborhood(neighborhood, dem, x - 1, y);
-			const z6 = sampleNeighborhood(neighborhood, dem, x + 1, y);
-			const z7 = sampleNeighborhood(neighborhood, dem, x - 1, y + 1);
-			const z8 = sampleNeighborhood(neighborhood, dem, x, y + 1);
-			const z9 = sampleNeighborhood(neighborhood, dem, x + 1, y + 1);
-			if ([z1, z2, z3, z4, z6, z7, z8, z9].some((value) => value === undefined)) {
-				continue;
-			}
-
-			const dzdx =
-				(z3! + 2 * z6! + z9! - (z1! + 2 * z4! + z7!)) / (8 * res);
-			const dzdy =
-				(z7! + 2 * z8! + z9! - (z1! + 2 * z2! + z3!)) / (8 * res);
-			const angle = (Math.atan(Math.hypot(dzdx, dzdy)) * 180) / Math.PI;
-			const [r, g, b, a] = slopeColorForAngle(angle);
-			const i = (y * width + x) * 4;
-			rgba[i] = r;
-			rgba[i + 1] = g;
-			rgba[i + 2] = b;
-			rgba[i + 3] = Math.round(a * 255);
-		}
-	}
-	return rgba;
+	return renderPaddedSlopeTileImageData(buildPaddedElevationGrid(dem, neighborhood), zoom, tileY);
 }

@@ -16,6 +16,12 @@ describe('weather helpers', () => {
 		expect(url.searchParams.get('daily')).toContain('precipitation_probability_max');
 	});
 
+	it('supports a deployment-owned weather endpoint', () => {
+		const url = new URL(weatherForecastUrl([77.18, 32.24], 'https://weather.example.com/v1'));
+		expect(url.origin).toBe('https://weather.example.com');
+		expect(url.searchParams.get('latitude')).toBe('32.24000');
+	});
+
 	it('parses current conditions and daily mountain-relevant values', () => {
 		const forecast = parseWeatherForecast({
 			latitude: 32.24,
@@ -50,6 +56,20 @@ describe('weather helpers', () => {
 	it('translates weather and wind codes into concise map labels', () => {
 		expect(weatherCondition(0).label).toBe('Clear');
 		expect(weatherCondition(95).label).toBe('Thunderstorm');
+		expect(weatherCondition(null).label).toBe('Unavailable');
 		expect(compassDirection(225)).toBe('SW');
+		expect(compassDirection(null)).toBe('—');
+	});
+
+	it('preserves missing values as unavailable rather than false zero readings', () => {
+		const forecast = parseWeatherForecast({
+			current: { time: '2026-07-11T23:30', weather_code: 0 },
+			daily: { time: ['2026-07-11'], weather_code: [0] }
+		});
+
+		expect(forecast.current.temperatureC).toBeNull();
+		expect(forecast.current.windSpeedKmh).toBeNull();
+		expect(forecast.days[0].precipitationProbabilityPct).toBeNull();
+		expect(forecast.current.weatherCode).toBe(0);
 	});
 });

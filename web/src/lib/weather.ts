@@ -1,29 +1,31 @@
+import { requestJson } from './request';
+
 export type LngLatTuple = [number, number];
 
 export type WeatherCurrent = {
-	temperatureC: number;
-	apparentTemperatureC: number;
-	precipitationMm: number;
-	weatherCode: number;
-	windSpeedKmh: number;
-	windDirectionDeg: number;
-	windGustKmh: number;
+	temperatureC: number | null;
+	apparentTemperatureC: number | null;
+	precipitationMm: number | null;
+	weatherCode: number | null;
+	windSpeedKmh: number | null;
+	windDirectionDeg: number | null;
+	windGustKmh: number | null;
 };
 
 export type WeatherDay = {
 	date: string;
-	weatherCode: number;
-	temperatureMaxC: number;
-	temperatureMinC: number;
-	precipitationProbabilityPct: number;
-	precipitationMm: number;
-	windSpeedMaxKmh: number;
-	windGustMaxKmh: number;
+	weatherCode: number | null;
+	temperatureMaxC: number | null;
+	temperatureMinC: number | null;
+	precipitationProbabilityPct: number | null;
+	precipitationMm: number | null;
+	windSpeedMaxKmh: number | null;
+	windGustMaxKmh: number | null;
 };
 
 export type WeatherForecast = {
-	latitude: number;
-	longitude: number;
+	latitude: number | null;
+	longitude: number | null;
 	timezone: string;
 	updatedAt: string;
 	current: WeatherCurrent;
@@ -50,9 +52,17 @@ const DAILY_FIELDS = [
 	'wind_gusts_10m_max'
 ];
 
-export function weatherForecastUrl(coordinates: LngLatTuple): string {
+export const DEFAULT_WEATHER_API_URL = 'https://api.open-meteo.com/v1/forecast';
+
+export function weatherForecastUrl(
+	coordinates: LngLatTuple,
+	endpoint = DEFAULT_WEATHER_API_URL
+): string {
 	const [longitude, latitude] = coordinates;
-	const url = new URL('https://api.open-meteo.com/v1/forecast');
+	const url = new URL(
+		endpoint,
+		typeof window === 'undefined' ? 'http://localhost/' : window.location.href
+	);
 	url.searchParams.set('latitude', latitude.toFixed(5));
 	url.searchParams.set('longitude', longitude.toFixed(5));
 	url.searchParams.set('current', CURRENT_FIELDS.join(','));
@@ -62,8 +72,8 @@ export function weatherForecastUrl(coordinates: LngLatTuple): string {
 	return url.toString();
 }
 
-function numberAt(value: unknown, fallback = 0): number {
-	return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+function numberOrNull(value: unknown): number | null {
+	return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 function arrayAt(value: unknown): unknown[] {
@@ -75,51 +85,67 @@ export function parseWeatherForecast(payload: unknown): WeatherForecast {
 	const root = payload as Record<string, unknown>;
 	const current = (root.current ?? {}) as Record<string, unknown>;
 	const daily = (root.daily ?? {}) as Record<string, unknown>;
-	const dates = arrayAt(daily.time);
+	const dates = arrayAt(daily.time)
+		.map((date, index) => ({ date, index }))
+		.filter(
+			(entry): entry is { date: string; index: number } =>
+				typeof entry.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry.date)
+		);
 	if (dates.length === 0 || typeof current.time !== 'string') {
 		throw new Error('Weather forecast is unavailable for this location');
 	}
 
 	const dayValue = (field: string, index: number) => arrayAt(daily[field])[index];
 	return {
-		latitude: numberAt(root.latitude),
-		longitude: numberAt(root.longitude),
-		timezone: typeof root.timezone === 'string' ? root.timezone : 'Local time',
+		latitude: numberOrNull(root.latitude),
+		longitude: numberOrNull(root.longitude),
+		timezone:
+			typeof root.timezone === 'string' && root.timezone.trim()
+				? root.timezone
+				: 'Local time',
 		updatedAt: current.time,
 		current: {
-			temperatureC: numberAt(current.temperature_2m),
-			apparentTemperatureC: numberAt(current.apparent_temperature),
-			precipitationMm: numberAt(current.precipitation),
-			weatherCode: numberAt(current.weather_code),
-			windSpeedKmh: numberAt(current.wind_speed_10m),
-			windDirectionDeg: numberAt(current.wind_direction_10m),
-			windGustKmh: numberAt(current.wind_gusts_10m)
+			temperatureC: numberOrNull(current.temperature_2m),
+			apparentTemperatureC: numberOrNull(current.apparent_temperature),
+			precipitationMm: numberOrNull(current.precipitation),
+			weatherCode: numberOrNull(current.weather_code),
+			windSpeedKmh: numberOrNull(current.wind_speed_10m),
+			windDirectionDeg: numberOrNull(current.wind_direction_10m),
+			windGustKmh: numberOrNull(current.wind_gusts_10m)
 		},
-		days: dates.map((date, index) => ({
-			date: String(date),
-			weatherCode: numberAt(dayValue('weather_code', index)),
-			temperatureMaxC: numberAt(dayValue('temperature_2m_max', index)),
-			temperatureMinC: numberAt(dayValue('temperature_2m_min', index)),
-			precipitationProbabilityPct: numberAt(
+		days: dates.map(({ date, index }) => ({
+			date,
+			weatherCode: numberOrNull(dayValue('weather_code', index)),
+			temperatureMaxC: numberOrNull(dayValue('temperature_2m_max', index)),
+			temperatureMinC: numberOrNull(dayValue('temperature_2m_min', index)),
+			precipitationProbabilityPct: numberOrNull(
 				dayValue('precipitation_probability_max', index)
 			),
-			precipitationMm: numberAt(dayValue('precipitation_sum', index)),
-			windSpeedMaxKmh: numberAt(dayValue('wind_speed_10m_max', index)),
-			windGustMaxKmh: numberAt(dayValue('wind_gusts_10m_max', index))
+			precipitationMm: numberOrNull(dayValue('precipitation_sum', index)),
+			windSpeedMaxKmh: numberOrNull(dayValue('wind_speed_10m_max', index)),
+			windGustMaxKmh: numberOrNull(dayValue('wind_gusts_10m_max', index))
 		}))
 	};
 }
 
 export async function fetchWeatherForecast(
 	coordinates: LngLatTuple,
-	signal?: AbortSignal
+	signal?: AbortSignal,
+	timeoutMs = 10_000,
+	endpoint = DEFAULT_WEATHER_API_URL
 ): Promise<WeatherForecast> {
-	const response = await fetch(weatherForecastUrl(coordinates), { signal });
+	const response = await requestJson<unknown>(weatherForecastUrl(coordinates, endpoint), {
+		signal,
+		timeoutMs
+	});
 	if (!response.ok) throw new Error(`Weather request failed with ${response.status}`);
-	return parseWeatherForecast(await response.json());
+	return parseWeatherForecast(response.data);
 }
 
-export function weatherCondition(code: number): { label: string; icon: string } {
+export function weatherCondition(code: number | null): { label: string; icon: string } {
+	if (code == null || !Number.isFinite(code) || code < 0) {
+		return { label: 'Unavailable', icon: '—' };
+	}
 	if (code === 0) return { label: 'Clear', icon: '☀' };
 	if (code <= 2) return { label: 'Partly cloudy', icon: '◒' };
 	if (code === 3) return { label: 'Overcast', icon: '☁' };
@@ -133,7 +159,8 @@ export function weatherCondition(code: number): { label: string; icon: string } 
 	return { label: 'Variable', icon: '◌' };
 }
 
-export function compassDirection(degrees: number): string {
+export function compassDirection(degrees: number | null): string {
+	if (degrees == null || !Number.isFinite(degrees)) return '—';
 	const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
 	const normalized = ((degrees % 360) + 360) % 360;
 	return directions[Math.round(normalized / 45) % directions.length];

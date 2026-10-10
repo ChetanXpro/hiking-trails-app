@@ -11,6 +11,10 @@ import {
 	PROVIDER_OUTDOOR_POI_TIERS,
 	providerPoiLayerId
 } from './outdoor-poi-config';
+import {
+	APP_POI_ICON_SPECS,
+	renderAppPoiIcon
+} from './outdoor-poi-icons';
 
 describe('outdoor-poi-config', () => {
 	it('puts emergency, overnight shelter, and potable water ahead of local comforts', () => {
@@ -53,6 +57,7 @@ describe('outdoor-poi-config', () => {
 
 	it('shows icons before labels for every locally controlled tier', () => {
 		for (const tier of CUSTOM_OUTDOOR_POI_TIERS) {
+			expect(APP_POI_ICON_SPECS[tier.icon]).toBeDefined();
 			expect(tier.labelMinzoom).toBeGreaterThan(tier.minzoom);
 			expect(buildCustomPoiFilter(tier)).toEqual([
 				'in',
@@ -62,6 +67,16 @@ describe('outdoor-poi-config', () => {
 			expect(poiLabelExpression(tier.labelMinzoom)).toEqual(
 				expect.arrayContaining(['step', ['zoom'], '', tier.labelMinzoom])
 			);
+		}
+	});
+
+	it('renders every local POI icon from app-owned RGBA data without a basemap sprite', () => {
+		for (const name of Object.keys(APP_POI_ICON_SPECS)) {
+			const image = renderAppPoiIcon(name);
+			expect(image.width).toBe(48);
+			expect(image.height).toBe(48);
+			expect(image.data).toHaveLength(48 * 48 * 4);
+			expect(image.data.some((value, index) => index % 4 === 3 && value > 0)).toBe(true);
 		}
 	});
 

@@ -9,6 +9,10 @@ For the current importer, use `hp.osm.pbf` with `osm2pgsql`. The smaller
 `hp-trails.osm.pbf` is only a legacy trails-only extract and does not
 contain enough admin/place data for hierarchical search.
 
+`build_himachal_trails.sh` creates `hp.osm.pbf` with reference-complete
+ordinary hiking routes and feature relations. State-level imports intentionally
+do not publish country-scale OSM `superroute` relations.
+
 These files are intentionally gitignored because they are large and
 machine-local.
 

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+	buildPaddedElevationGrid,
 	metersPerPixel,
+	renderPaddedSlopeTileImageData,
 	renderSlopeTileImageData,
 	slopeColorForAngle,
 	SLOPE_BANDS,
@@ -132,8 +134,13 @@ describe('slope-config', () => {
 		const neighborhood = uniformSlopeNeighborhood(42);
 		const center = neighborhood[4];
 		const rgba = renderSlopeTileImageData(center, 13, 1600, neighborhood);
+		const padded = buildPaddedElevationGrid(center, neighborhood);
+		const workerRgba = renderPaddedSlopeTileImageData(padded, 13, 1600);
 		const expected = [...forty.color, Math.round(forty.alpha * 255)];
 		expect(pixel(rgba, 0, 3, center.width)).toEqual(expected);
 		expect(pixel(rgba, center.width - 1, 4, center.width)).toEqual(expected);
+		expect(workerRgba).toEqual(rgba);
+		expect(padded.data.length).toBe((center.width + 2) * (center.height + 2));
+		expect(padded.data.length).toBeLessThan(center.data.length * neighborhood.length);
 	});
 });

@@ -23,6 +23,21 @@
 			new Date(`${date}T12:00:00`)
 		);
 	}
+
+	function rounded(value: number | null, suffix = '') {
+		return value == null ? '—' : `${Math.round(value)}${suffix}`;
+	}
+
+	function decimal(value: number | null, suffix = '') {
+		return value == null ? '—' : `${value.toFixed(1)}${suffix}`;
+	}
+
+	function windLabel(direction: number | null, speed: number | null) {
+		if (direction == null && speed == null) return '—';
+		const bearing = compassDirection(direction);
+		const velocity = speed == null ? null : `${Math.round(speed)} km/h`;
+		return [bearing === '—' ? null : bearing, velocity].filter(Boolean).join(' ');
+	}
 </script>
 
 <section class:compact class="weather-card" aria-busy={status === 'loading'}>
@@ -52,18 +67,18 @@
 		<div class="weather-now">
 			<span class="weather-icon" aria-hidden="true">{condition.icon}</span>
 			<div>
-				<strong>{Math.round(forecast.current.temperatureC)}°</strong>
+				<strong>{rounded(forecast.current.temperatureC, '°')}</strong>
 				<span>{condition.label}</span>
 			</div>
 			<div class="weather-wind">
-				<strong>{compassDirection(forecast.current.windDirectionDeg)} {Math.round(forecast.current.windSpeedKmh)}</strong>
-				<span>km/h · gust {Math.round(forecast.current.windGustKmh)}</span>
+				<strong>{windLabel(forecast.current.windDirectionDeg, forecast.current.windSpeedKmh)}</strong>
+				<span>{forecast.current.windGustKmh == null ? 'Gust unavailable' : `gust ${Math.round(forecast.current.windGustKmh)} km/h`}</span>
 			</div>
 		</div>
 
 		<div class="weather-metrics">
-			<div><span>Feels</span><strong>{Math.round(forecast.current.apparentTemperatureC)}°</strong></div>
-			<div><span>Rain now</span><strong>{forecast.current.precipitationMm.toFixed(1)} mm</strong></div>
+			<div><span>Feels</span><strong>{rounded(forecast.current.apparentTemperatureC, '°')}</strong></div>
+			<div><span>Rain now</span><strong>{decimal(forecast.current.precipitationMm, ' mm')}</strong></div>
 			<div><span>Local time</span><strong>{forecast.timezone.split('/').pop()?.replaceAll('_', ' ')}</strong></div>
 		</div>
 
@@ -73,8 +88,8 @@
 				<div class="weather-day">
 					<span>{dayLabel(day.date, index)}</span>
 					<b aria-label={dayCondition.label}>{dayCondition.icon}</b>
-					<strong>{Math.round(day.temperatureMaxC)}° <small>{Math.round(day.temperatureMinC)}°</small></strong>
-					<em>{Math.round(day.precipitationProbabilityPct)}% · {Math.round(day.windGustMaxKmh)} km/h</em>
+					<strong>{rounded(day.temperatureMaxC, '°')} <small>{rounded(day.temperatureMinC, '°')}</small></strong>
+					<em>{rounded(day.precipitationProbabilityPct, '%')} · {rounded(day.windGustMaxKmh, ' km/h')}</em>
 				</div>
 			{/each}
 		</div>

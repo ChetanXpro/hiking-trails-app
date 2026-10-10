@@ -1,6 +1,19 @@
 import { OUTDOOR_THEME } from './outdoor-theme';
+import { isBasemapPoiLayer } from './outdoor-poi-config';
 
 export const DEFAULT_BASEMAP_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
+export const OSM_DATA_ATTRIBUTION =
+	'<a href="https://www.openstreetmap.org/copyright">&copy; OpenStreetMap contributors</a>';
+
+export function buildOsmDerivedVectorSource(tileUrl: string) {
+	return {
+		type: 'vector' as const,
+		tiles: [tileUrl],
+		minzoom: 0,
+		maxzoom: 14,
+		attribution: OSM_DATA_ATTRIBUTION
+	};
+}
 
 export type BasemapLayerSummary = {
 	id: string;
@@ -243,7 +256,17 @@ export function absolutizeBasemapStyleResources<T extends MutableBasemapStyle>(
 export function prepareOutdoorBasemapStyle<T extends MutableBasemapStyle>(style: T): T {
 	for (const layer of style.layers) {
 		const sourceLayer = layer.sourceLayer ?? layer['source-layer'];
-		if (shouldHideBasemapLayer({ id: layer.id, type: layer.type, sourceLayer })) {
+		const id = layer.id.toLowerCase();
+		const sourceLayerLower = sourceLayer?.toLowerCase() ?? '';
+		const duplicateProviderSymbol =
+			layer.type === 'symbol' &&
+			(isBasemapPoiLayer(layer.id, sourceLayer) ||
+				/mountain_peak/.test(sourceLayerLower) ||
+				/(^|[-_])(mountain|peak)([-_]|$)/.test(id));
+		if (
+			shouldHideBasemapLayer({ id: layer.id, type: layer.type, sourceLayer }) ||
+			duplicateProviderSymbol
+		) {
 			layer.layout = { ...layer.layout, visibility: 'none' };
 		}
 

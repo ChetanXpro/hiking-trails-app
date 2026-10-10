@@ -11,19 +11,19 @@ export const OUTDOOR_THEME = {
 	brandHover: '#245443',
 	focus: '#79C69B',
 	surface: {
-		canvas: '#EDE8DB',
+		canvas: '#E8E3D7',
 		elevated: '#FAF7EE',
-		protected: '#B2CBA2',
-		forest: '#A6C095',
-		grass: '#CED9AD',
-		rock: '#D8D2C5',
-		wetland: '#B9CDB8',
-		residential: '#E7E0D4',
-		ice: '#CBE4E9',
-		sand: '#DFCFAF',
-		water: '#8FC9DE',
-		waterLine: '#4A99C0',
-		building: '#D1C9BD'
+		protected: '#A8C09A',
+		forest: '#9DB084',
+		grass: '#C5D09A',
+		rock: '#D0C9BC',
+		wetland: '#B0C3AF',
+		residential: '#DFD8CC',
+		ice: '#C0D9DE',
+		sand: '#D5C5A5',
+		water: '#7FBFD3',
+		waterLine: '#3D8EB5',
+		building: '#C9C1B5'
 	},
 	ink: {
 		strong: '#25302A',
@@ -51,11 +51,11 @@ export const OUTDOOR_THEME = {
 		label: '#9E241F'
 	},
 	contour: {
-		minor: '#7B766C',
-		intermediate: '#6E675C',
-		index: '#5C554B',
-		label: '#51483E',
-		halo: 'rgba(250, 247, 238, 0.98)'
+		minor: '#6B6560',
+		intermediate: '#5E5751',
+		index: '#4C453B',
+		label: '#3D3430',
+		halo: 'rgba(237, 232, 219, 0.95)'
 	},
 	label: {
 		primary: '#25302A',

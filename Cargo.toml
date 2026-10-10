@@ -9,7 +9,7 @@ members = [
 # Shared dependency versions across all crates -- keeps everything
 # in lockstep and avoids duplicate-version bloat in the build.
 [workspace.dependencies]
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "derive"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
