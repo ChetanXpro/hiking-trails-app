@@ -148,6 +148,7 @@ fn walk_component(
     let mut previous_member_index: Option<usize> = None;
     let mut order_penalty = 0usize;
     let mut role_mismatches = 0usize;
+    let mut encountered_branch = false;
 
     loop {
         let Some(candidates) = adjacency.get(&current) else {
@@ -205,10 +206,14 @@ fn walk_component(
         current = if a == current { b } else { a };
 
         if degree.get(&current).copied().unwrap_or(0) >= 3 {
-            warnings.push(
-                "branch point at a shared node -- this route has a junction, not a simple path; took the first available continuation rather than guessing the intended branch".to_string()
-            );
+            encountered_branch = true;
         }
+    }
+
+    if encountered_branch {
+        warnings.push(
+            "branch point at a shared node -- this route has a junction, not a simple path; took the first available continuation rather than guessing the intended branch".to_string()
+        );
     }
 
     let stranded = adjacency

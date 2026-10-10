@@ -900,6 +900,7 @@ version = "0.1.0"
 dependencies = [
  "actix-web",
  "anyhow",
+ "chrono",
  "dotenvy",
  "hiking-db",
  "serde",
@@ -931,6 +932,7 @@ name = "hiking-import"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dotenvy",
  "geo-types",
  "hiking-db",

@@ -1,7 +1,9 @@
 mod stitch;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use hiking_db::decode_wkb;
+use serde::Deserialize;
 use serde_json::Value;
 use sqlx::{types::Json, FromRow, Postgres, QueryBuilder};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -17,6 +19,25 @@ const DEFAULT_ELEVATION_SAMPLE_SPACING_M: f64 = 30.0;
 const MIN_ELEVATION_SAMPLES: usize = 24;
 const DEFAULT_ELEVATION_SMOOTHING_WINDOW: usize = 5;
 const DEFAULT_GAIN_LOSS_THRESHOLD_M: f64 = 10.0;
+const MAX_ORIGINAL_MAPPER_MANIFEST_BYTES: u64 = 5 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalMapperManifest {
+    schema_version: u32,
+    relations: Vec<OriginalMapperManifestEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalMapperManifestEntry {
+    osm_relation_id: i64,
+    osm_relation_version: u32,
+    display_name: String,
+    provider_user_id: Option<String>,
+    profile_url: Option<String>,
+    mapped_at: DateTime<Utc>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,6 +47,8 @@ async fn main() -> Result<()> {
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
     let pool = hiking_db::create_pool(&database_url).await?;
     ensure_expected_schema(&pool).await?;
+    sync_regions_and_places(&pool).await?;
+    sync_outdoor_waypoints(&pool).await?;
     let elevation_sampler = ElevationSampler::from_env()?;
     let landcover_sampler = LandcoverSampler::from_env()?;
 
@@ -51,24 +74,7 @@ async fn main() -> Result<()> {
         SELECT
             osm_id,
             tags,
-            COALESCE(
-                members,
-                (
-                    SELECT COALESCE(
-                        jsonb_agg(
-                            jsonb_build_object(
-                                'type', 'w',
-                                'ref', item.value::bigint,
-                                'role', ''
-                            )
-                            ORDER BY item.ordinality
-                        ),
-                        '[]'::jsonb
-                    )
-                    FROM jsonb_array_elements_text(member_ids) WITH ORDINALITY AS item(value, ordinality)
-                ),
-                '[]'::jsonb
-            ) AS members
+            members
         FROM raw_relations
         ORDER BY osm_id
         "#,
@@ -120,6 +126,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!(succeeded, failed, "stitching pass complete");
+    sync_original_mapper_manifest_from_env(&pool).await?;
     Ok(())
 }
 
@@ -137,7 +144,622 @@ async fn ensure_expected_schema(pool: &sqlx::PgPool) -> Result<()> {
         );
     }
 
+    let places_table =
+        sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass('public.places')::text")
+            .fetch_one(pool)
+            .await
+            .context("checking places schema object")?;
+
+    if places_table.is_none() {
+        anyhow::bail!(
+            "database schema is missing 'places' (migration 0010). Run `sqlx migrate run` and then rerun `cargo run -p hiking-import`"
+        );
+    }
+
+    let has_original_mapper_columns = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT COUNT(*) = 6
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'trails'
+          AND column_name IN (
+              'original_mapper_name',
+              'original_mapper_provider',
+              'original_mapper_user_id',
+              'original_mapper_profile_url',
+              'original_mapped_at',
+              'original_mapper_source'
+          )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("checking original mapper attribution schema")?;
+
+    if !has_original_mapper_columns {
+        anyhow::bail!(
+            "database schema is missing original mapper attribution columns (migration 0013). Run `sqlx migrate run` and then rerun `cargo run -p hiking-import`"
+        );
+    }
+
+    let outdoor_waypoints_table = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT to_regclass('public.outdoor_waypoints')::text",
+    )
+    .fetch_one(pool)
+    .await
+    .context("checking outdoor waypoint schema object")?;
+
+    if outdoor_waypoints_table.is_none() {
+        anyhow::bail!(
+            "database schema is missing 'outdoor_waypoints' (migration 0012). Run `sqlx migrate run` and then rerun `cargo run -p hiking-import`"
+        );
+    }
+
+    ensure_raw_osm_identity_column(pool, "raw_waypoints").await?;
+    ensure_raw_osm_identity_column(pool, "raw_places").await?;
+
     Ok(())
+}
+
+fn parse_original_mapper_manifest(bytes: &[u8]) -> Result<OriginalMapperManifest> {
+    let mut manifest: OriginalMapperManifest =
+        serde_json::from_slice(bytes).context("parsing original mapper manifest JSON")?;
+
+    if manifest.schema_version != 1 {
+        anyhow::bail!(
+            "unsupported original mapper manifest schema_version {}; expected 1",
+            manifest.schema_version
+        );
+    }
+
+    let mut relation_ids = HashSet::with_capacity(manifest.relations.len());
+    for entry in &mut manifest.relations {
+        if entry.osm_relation_id <= 0 {
+            anyhow::bail!("original mapper manifest contains an invalid OSM relation id");
+        }
+        if entry.osm_relation_version != 1 {
+            anyhow::bail!(
+                "original mapper entry for relation {} is version {}; only relation version 1 proves original map authorship",
+                entry.osm_relation_id,
+                entry.osm_relation_version
+            );
+        }
+        if !relation_ids.insert(entry.osm_relation_id) {
+            anyhow::bail!(
+                "original mapper manifest contains relation {} more than once",
+                entry.osm_relation_id
+            );
+        }
+
+        entry.display_name = entry.display_name.trim().to_string();
+        if entry.display_name.is_empty() || entry.display_name.len() > 255 {
+            anyhow::bail!(
+                "original mapper entry for relation {} has an invalid display_name",
+                entry.osm_relation_id
+            );
+        }
+
+        entry.provider_user_id = entry
+            .provider_user_id
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        if let Some(profile_url) = entry.profile_url.as_mut() {
+            *profile_url = profile_url.trim().to_string();
+            if !profile_url.starts_with("https://www.openstreetmap.org/user/") {
+                anyhow::bail!(
+                    "original mapper entry for relation {} has a profile_url outside openstreetmap.org",
+                    entry.osm_relation_id
+                );
+            }
+        }
+    }
+
+    Ok(manifest)
+}
+
+async fn sync_original_mapper_manifest_from_env(pool: &sqlx::PgPool) -> Result<()> {
+    let Some(path) = std::env::var("OSM_ORIGINAL_MAPPERS_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        tracing::info!(
+            "OSM_ORIGINAL_MAPPERS_PATH not set -- original OSM relation authorship remains unchanged"
+        );
+        return Ok(());
+    };
+
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("reading original mapper manifest metadata from {path}"))?;
+    if metadata.len() > MAX_ORIGINAL_MAPPER_MANIFEST_BYTES {
+        anyhow::bail!(
+            "original mapper manifest is larger than {} bytes",
+            MAX_ORIGINAL_MAPPER_MANIFEST_BYTES
+        );
+    }
+
+    let bytes =
+        fs::read(&path).with_context(|| format!("reading original mapper manifest from {path}"))?;
+    let manifest = parse_original_mapper_manifest(&bytes)?;
+    let listed = manifest.relations.len();
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("starting original mapper manifest transaction")?;
+    let mut matched = 0usize;
+
+    for entry in manifest.relations {
+        let result = sqlx::query(
+            r#"
+            UPDATE trails
+            SET original_mapper_name = $2,
+                original_mapper_provider = 'osm',
+                original_mapper_user_id = $3,
+                original_mapper_profile_url = $4,
+                original_mapped_at = $5,
+                original_mapper_source = 'osm_relation_version_1_manifest',
+                updated_at = now()
+            WHERE osm_relation_id = $1
+            "#,
+        )
+        .bind(entry.osm_relation_id)
+        .bind(entry.display_name)
+        .bind(entry.provider_user_id)
+        .bind(entry.profile_url)
+        .bind(entry.mapped_at)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "applying original mapper attribution for relation {}",
+                entry.osm_relation_id
+            )
+        })?;
+
+        matched += result.rows_affected() as usize;
+    }
+
+    tx.commit()
+        .await
+        .context("committing original mapper manifest")?;
+    tracing::info!(
+        path,
+        listed,
+        matched,
+        unmatched = listed.saturating_sub(matched),
+        "original OSM relation authorship manifest applied"
+    );
+
+    Ok(())
+}
+
+async fn ensure_raw_osm_identity_column(pool: &sqlx::PgPool, table_name: &str) -> Result<()> {
+    let has_osm_type = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = $1
+              AND column_name = 'osm_type'
+        )
+        "#,
+    )
+    .bind(table_name)
+    .fetch_one(pool)
+    .await
+    .with_context(|| format!("checking {table_name} OSM identity column"))?;
+
+    if raw_table_exists(pool, table_name).await? && !has_osm_type {
+        anyhow::bail!(
+            "{table_name} uses the old node-only staging schema. Re-run osm2pgsql with the updated `osm2pgsql/trails.lua`, then rerun `cargo run -p hiking-import`."
+        );
+    }
+
+    Ok(())
+}
+
+async fn sync_regions_and_places(pool: &sqlx::PgPool) -> Result<()> {
+    sync_regions(pool).await?;
+    sync_places(pool).await?;
+    Ok(())
+}
+
+async fn sync_regions(pool: &sqlx::PgPool) -> Result<()> {
+    if !raw_table_exists(pool, "raw_regions").await? {
+        tracing::info!("raw_regions staging table not present -- skipping region hierarchy sync");
+        return Ok(());
+    }
+
+    let raw_regions = sqlx::query_as::<_, RawRegionRow>(
+        r#"
+        SELECT
+            osm_id,
+            tags,
+            ST_AsBinary(
+                ST_Multi(ST_CollectionExtract(ST_MakeValid(geom), 3))
+            ) AS geom_wkb
+        FROM raw_regions
+        ORDER BY osm_id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("fetching raw_regions")?;
+
+    if raw_regions.is_empty() {
+        tracing::info!("raw_regions staging table is empty -- skipping region hierarchy sync");
+        return Ok(());
+    }
+
+    let region_rows = raw_regions
+        .into_iter()
+        .filter_map(|region| {
+            let name = tag_str(&region.tags, "name")?.to_owned();
+            Some((
+                region.osm_id,
+                name,
+                parse_admin_level_tag(&region.tags),
+                tag_str(&region.tags, "boundary")
+                    .unwrap_or("administrative")
+                    .to_owned(),
+                extract_country_code(&region.tags),
+                region.geom_wkb,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if region_rows.is_empty() {
+        tracing::info!("no named administrative regions found in raw_regions");
+        return Ok(());
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("starting region sync transaction")?;
+
+    sqlx::query("UPDATE regions SET parent_region_id = NULL")
+        .execute(&mut *tx)
+        .await
+        .context("clearing region parent pointers before sync")?;
+
+    for chunk in region_rows.chunks(500) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO regions (
+                osm_relation_id,
+                name,
+                admin_level,
+                boundary_kind,
+                country_code,
+                boundary
+            )
+            "#,
+        );
+
+        query.push_values(chunk, |mut builder, row| {
+            builder
+                .push_bind(row.0)
+                .push_bind(&row.1)
+                .push_bind(row.2)
+                .push_bind(&row.3)
+                .push_bind(&row.4);
+
+            builder
+                .push_unseparated(
+                    ", ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_SetSRID(ST_GeomFromWKB(",
+                )
+                .push_bind_unseparated(&row.5)
+                .push_unseparated("), 4326)), 3))");
+        });
+
+        query.push(
+            r#"
+            ON CONFLICT (osm_relation_id) DO UPDATE
+            SET name = EXCLUDED.name,
+                admin_level = EXCLUDED.admin_level,
+                boundary_kind = EXCLUDED.boundary_kind,
+                country_code = COALESCE(EXCLUDED.country_code, regions.country_code),
+                boundary = EXCLUDED.boundary,
+                updated_at = now()
+            "#,
+        );
+
+        query
+            .build()
+            .execute(&mut *tx)
+            .await
+            .context("upserting administrative regions")?;
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE regions child
+        SET parent_region_id = (
+                SELECT parent.id
+                FROM regions parent
+                WHERE parent.id <> child.id
+                  AND parent.boundary IS NOT NULL
+                  AND child.boundary IS NOT NULL
+                  AND parent.admin_level IS NOT NULL
+                  AND (
+                      child.admin_level IS NULL
+                      OR parent.admin_level < child.admin_level
+                  )
+                  AND ST_Covers(parent.boundary, ST_PointOnSurface(child.boundary))
+                ORDER BY parent.admin_level DESC, ST_Area(parent.boundary) ASC
+                LIMIT 1
+            ),
+            country_code = COALESCE(
+                child.country_code,
+                (
+                    SELECT parent.country_code
+                    FROM regions parent
+                    WHERE parent.id <> child.id
+                      AND parent.boundary IS NOT NULL
+                      AND child.boundary IS NOT NULL
+                      AND parent.admin_level IS NOT NULL
+                      AND (
+                          child.admin_level IS NULL
+                          OR parent.admin_level < child.admin_level
+                      )
+                      AND ST_Covers(parent.boundary, ST_PointOnSurface(child.boundary))
+                    ORDER BY parent.admin_level DESC, ST_Area(parent.boundary) ASC
+                    LIMIT 1
+                )
+            ),
+            updated_at = now()
+        WHERE child.boundary IS NOT NULL
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .context("linking region parent hierarchy")?;
+
+    tx.commit()
+        .await
+        .context("committing region hierarchy sync")?;
+    tracing::info!(count = region_rows.len(), "region hierarchy synced");
+    Ok(())
+}
+
+async fn sync_places(pool: &sqlx::PgPool) -> Result<()> {
+    if !raw_table_exists(pool, "raw_places").await? {
+        tracing::info!("raw_places staging table not present -- skipping named-place sync");
+        return Ok(());
+    }
+
+    let raw_places = sqlx::query_as::<_, RawPlaceRow>(
+        r#"
+        SELECT osm_type::text AS osm_type, osm_id, tags, ST_AsBinary(geom) AS geom_wkb
+        FROM raw_places
+        ORDER BY osm_id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("fetching raw_places")?;
+
+    if raw_places.is_empty() {
+        tracing::info!("raw_places staging table is empty -- skipping named-place sync");
+        return Ok(());
+    }
+
+    let place_rows = raw_places
+        .into_iter()
+        .filter_map(|place| {
+            let name = tag_str(&place.tags, "name")?.to_owned();
+            let place_kind = tag_str(&place.tags, "place")?.to_owned();
+            Some((
+                osm_type_name(&place.osm_type)?.to_string(),
+                place.osm_id,
+                name,
+                place_kind,
+                extract_country_code(&place.tags),
+                place.geom_wkb,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if place_rows.is_empty() {
+        tracing::info!("no named places found in raw_places");
+        return Ok(());
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("starting named-place sync transaction")?;
+
+    for chunk in place_rows.chunks(1000) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO places (
+                osm_type,
+                osm_id,
+                name,
+                place_kind,
+                country_code,
+                geom
+            )
+            "#,
+        );
+
+        query.push_values(chunk, |mut builder, row| {
+            builder
+                .push_bind(&row.0)
+                .push_bind(row.1)
+                .push_bind(&row.2)
+                .push_bind(&row.3)
+                .push_bind(&row.4);
+
+            builder
+                .push_unseparated(", ST_SetSRID(ST_GeomFromWKB(")
+                .push_bind_unseparated(&row.5)
+                .push_unseparated("), 4326)");
+        });
+
+        query.push(
+            r#"
+            ON CONFLICT (osm_type, osm_id) DO UPDATE
+            SET name = EXCLUDED.name,
+                place_kind = EXCLUDED.place_kind,
+                country_code = COALESCE(EXCLUDED.country_code, places.country_code),
+                geom = EXCLUDED.geom,
+                updated_at = now()
+            "#,
+        );
+
+        query
+            .build()
+            .execute(&mut *tx)
+            .await
+            .context("upserting named places")?;
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE places
+        SET region_id = NULL
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .context("clearing place region assignments before sync")?;
+
+    sqlx::query(
+        r#"
+        UPDATE places place
+        SET region_id = (
+                SELECT region.id
+                FROM regions region
+                WHERE region.boundary IS NOT NULL
+                  AND ST_Covers(region.boundary, place.geom)
+                ORDER BY region.admin_level DESC NULLS LAST, ST_Area(region.boundary) ASC
+                LIMIT 1
+            ),
+            country_code = COALESCE(
+                place.country_code,
+                (
+                    SELECT region.country_code
+                    FROM regions region
+                    WHERE region.boundary IS NOT NULL
+                      AND ST_Covers(region.boundary, place.geom)
+                    ORDER BY region.admin_level DESC NULLS LAST, ST_Area(region.boundary) ASC
+                    LIMIT 1
+                )
+            ),
+            updated_at = now()
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .context("assigning places to containing regions")?;
+
+    tx.commit().await.context("committing named-place sync")?;
+    tracing::info!(count = place_rows.len(), "named places synced");
+    Ok(())
+}
+
+async fn sync_outdoor_waypoints(pool: &sqlx::PgPool) -> Result<()> {
+    if !raw_table_exists(pool, "raw_waypoints").await? {
+        tracing::info!("raw_waypoints staging table not present -- skipping outdoor waypoint sync");
+        return Ok(());
+    }
+
+    let raw_waypoints = sqlx::query_as::<_, RawWaypointRow>(
+        r#"
+        SELECT osm_type::text AS osm_type, osm_id, tags, ST_AsBinary(geom) AS geom_wkb
+        FROM raw_waypoints
+        ORDER BY osm_type, osm_id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("fetching outdoor waypoints")?;
+
+    let rows = raw_waypoints
+        .into_iter()
+        .filter_map(|waypoint| {
+            let osm_type = normalized_osm_type(&waypoint.osm_type)?.to_string();
+            let kind = infer_waypoint_kind(&waypoint.tags).to_string();
+            let name = tag_str(&waypoint.tags, "name").map(str::to_owned);
+            let elevation_m = tag_str(&waypoint.tags, "ele").and_then(parse_elevation);
+            Some((
+                osm_type,
+                waypoint.osm_id,
+                kind,
+                name,
+                elevation_m,
+                waypoint.geom_wkb,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("starting outdoor waypoint sync transaction")?;
+
+    sqlx::query("DELETE FROM outdoor_waypoints")
+        .execute(&mut *tx)
+        .await
+        .context("clearing outdoor waypoints before sync")?;
+
+    for chunk in rows.chunks(1000) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO outdoor_waypoints (
+                osm_type,
+                osm_id,
+                kind,
+                name,
+                elevation_m,
+                geom
+            )
+            "#,
+        );
+
+        query.push_values(chunk, |mut builder, row| {
+            builder
+                .push_bind(&row.0)
+                .push_bind(row.1)
+                .push_bind(&row.2)
+                .push_bind(&row.3)
+                .push_bind(row.4);
+
+            builder
+                .push_unseparated(", ST_SetSRID(ST_GeomFromWKB(")
+                .push_bind_unseparated(&row.5)
+                .push_unseparated("), 4326)");
+        });
+
+        query
+            .build()
+            .execute(&mut *tx)
+            .await
+            .context("inserting outdoor waypoints")?;
+    }
+
+    tx.commit()
+        .await
+        .context("committing outdoor waypoint sync")?;
+    tracing::info!(count = rows.len(), "outdoor waypoints synced");
+    Ok(())
+}
+
+async fn raw_table_exists(pool: &sqlx::PgPool, table_name: &str) -> Result<bool> {
+    let table = sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass($1)::text")
+        .bind(format!("public.{table_name}"))
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("checking staging table existence for {table_name}"))?;
+
+    Ok(table.is_some())
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -167,6 +789,22 @@ struct RawWayRow {
 
 #[derive(Debug, Clone, FromRow)]
 struct RawWaypointRow {
+    osm_type: String,
+    osm_id: i64,
+    tags: Value,
+    geom_wkb: Vec<u8>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct RawRegionRow {
+    osm_id: i64,
+    tags: Value,
+    geom_wkb: Vec<u8>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct RawPlaceRow {
+    osm_type: String,
     osm_id: i64,
     tags: Value,
     geom_wkb: Vec<u8>,
@@ -211,12 +849,22 @@ struct ComputedElevationProfile {
 struct RasterSource {
     path: PathBuf,
     nodata_value: Option<f64>,
+    bounds_wgs84: Option<RasterBounds>,
+    nominal_resolution_m: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct GdalCapabilities {
     supports_batch_queries: bool,
     supports_interpolation_flag: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RasterBounds {
+    min_lon: f64,
+    min_lat: f64,
+    max_lon: f64,
+    max_lat: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -376,7 +1024,6 @@ async fn stitch_one_relation(
     } else {
         Vec::new()
     };
-
     let mut tx = pool.begin().await.context("starting transaction")?;
 
     let trail_id: Uuid = sqlx::query_scalar(
@@ -535,6 +1182,110 @@ async fn stitch_one_relation(
     .await
     .context("updating trail geometry and region")?;
 
+    sqlx::query(
+        r#"
+        INSERT INTO trail_lines (
+            osm_relation_id,
+            id,
+            name,
+            network,
+            difficulty,
+            hike_type,
+            geom
+        )
+        SELECT
+            osm_relation_id,
+            id,
+            name,
+            network,
+            difficulty,
+            hike_type,
+            geom::geometry(MultiLineString, 4326)
+        FROM trails
+        WHERE id = $1
+          AND geom IS NOT NULL
+        ON CONFLICT (osm_relation_id) DO UPDATE
+        SET id = EXCLUDED.id,
+            name = EXCLUDED.name,
+            network = EXCLUDED.network,
+            difficulty = EXCLUDED.difficulty,
+            hike_type = EXCLUDED.hike_type,
+            geom = EXCLUDED.geom
+        "#,
+    )
+    .bind(trail_id)
+    .execute(&mut *tx)
+    .await
+    .context("upserting martin trail_lines row")?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM trail_start_points
+        WHERE id = $1
+        "#,
+    )
+    .bind(trail_id)
+    .execute(&mut *tx)
+    .await
+    .context("deleting prior martin trail_start_points row")?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO trail_start_points (
+            osm_relation_id,
+            id,
+            name,
+            geom
+        )
+        SELECT
+            osm_relation_id,
+            id,
+            name,
+            start_point::geometry(Point, 4326)
+        FROM trails
+        WHERE id = $1
+          AND start_point IS NOT NULL
+        "#,
+    )
+    .bind(trail_id)
+    .execute(&mut *tx)
+    .await
+    .context("upserting martin trail_start_points row")?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM trail_end_points
+        WHERE id = $1
+        "#,
+    )
+    .bind(trail_id)
+    .execute(&mut *tx)
+    .await
+    .context("deleting prior martin trail_end_points row")?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO trail_end_points (
+            osm_relation_id,
+            id,
+            name,
+            geom
+        )
+        SELECT
+            osm_relation_id,
+            id,
+            name,
+            end_point::geometry(Point, 4326)
+        FROM trails
+        WHERE id = $1
+          AND end_point IS NOT NULL
+        "#,
+    )
+    .bind(trail_id)
+    .execute(&mut *tx)
+    .await
+    .context("upserting martin trail_end_points row")?;
+
     let surface_rows = surface_totals
         .into_iter()
         .map(|(surface_type, distance_m)| {
@@ -550,7 +1301,7 @@ async fn stitch_one_relation(
 
     let nearby_waypoints = sqlx::query_as::<_, RawWaypointRow>(
         r#"
-        SELECT osm_id, tags, ST_AsBinary(geom) AS geom_wkb
+        SELECT osm_type::text AS osm_type, osm_id, tags, ST_AsBinary(geom) AS geom_wkb
         FROM raw_waypoints
         WHERE ST_DWithin(
             geom::geography,
@@ -580,6 +1331,9 @@ async fn stitch_one_relation(
         waypoint_rows.push((
             Uuid::new_v4(),
             trail_id,
+            normalized_osm_type(&waypoint.osm_type)
+                .unwrap_or("N")
+                .to_string(),
             waypoint.osm_id,
             kind.to_string(),
             name.map(str::to_owned),
@@ -1052,6 +1806,7 @@ async fn insert_waypoints_batch(
     rows: &[(
         Uuid,
         Uuid,
+        String,
         i64,
         String,
         Option<String>,
@@ -1065,21 +1820,25 @@ async fn insert_waypoints_batch(
 
     let mut query = QueryBuilder::<Postgres>::new(
         r#"
-        INSERT INTO waypoints (id, trail_id, osm_node_id, type, name, elevation_m, geom)
+        INSERT INTO waypoints (
+            id, trail_id, osm_type, osm_id, osm_node_id, type, name, elevation_m, geom
+        )
         "#,
     );
     query.push_values(rows, |mut builder, row| {
         builder
             .push_bind(row.0)
             .push_bind(row.1)
-            .push_bind(row.2)
-            .push_bind(&row.3)
+            .push_bind(&row.2)
+            .push_bind(row.3)
+            .push_bind(if row.2 == "N" { Some(row.3) } else { None })
             .push_bind(&row.4)
-            .push_bind(row.5);
+            .push_bind(&row.5)
+            .push_bind(row.6);
 
         builder
             .push_unseparated(", ST_GeomFromWKB(")
-            .push_bind_unseparated(&row.6)
+            .push_bind_unseparated(&row.7)
             .push_unseparated(", 4326)");
     });
 
@@ -1194,10 +1953,7 @@ async fn insert_diagnostic_points_batch(
         "#,
     );
     query.push_values(rows, |mut builder, row| {
-        builder
-            .push_bind(row.0)
-            .push_bind(row.1)
-            .push_bind(&row.2);
+        builder.push_bind(row.0).push_bind(row.1).push_bind(&row.2);
 
         builder
             .push_unseparated(", ST_SetSRID(ST_MakePoint(")
@@ -1220,6 +1976,49 @@ fn tag_str<'a>(tags: &'a Value, key: &str) -> Option<&'a str> {
     tags.get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
+}
+
+fn normalized_osm_type(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "N" => Some("N"),
+        "W" => Some("W"),
+        "R" => Some("R"),
+        _ => None,
+    }
+}
+
+fn osm_type_name(value: &str) -> Option<&'static str> {
+    match normalized_osm_type(value)? {
+        "N" => Some("node"),
+        "W" => Some("way"),
+        "R" => Some("relation"),
+        _ => None,
+    }
+}
+
+fn parse_admin_level_tag(tags: &Value) -> Option<i16> {
+    tag_str(tags, "admin_level").and_then(|value| value.parse::<i16>().ok())
+}
+
+fn extract_country_code(tags: &Value) -> Option<String> {
+    tag_str(tags, "ISO3166-1:alpha2")
+        .and_then(normalize_country_code)
+        .or_else(|| {
+            tag_str(tags, "ISO3166-2")
+                .and_then(|value| value.split('-').next())
+                .and_then(normalize_country_code)
+        })
+        .or_else(|| tag_str(tags, "is_in:country_code").and_then(normalize_country_code))
+        .or_else(|| tag_str(tags, "addr:country").and_then(normalize_country_code))
+}
+
+fn normalize_country_code(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_uppercase();
+    if normalized.len() == 2 && normalized.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        Some(normalized)
+    } else {
+        None
+    }
 }
 
 fn derive_difficulty(tags: &Value, ways: &HashMap<i64, RawWayRow>) -> Option<String> {
@@ -1286,11 +2085,52 @@ fn normalize_surface(surface: Option<&str>, highway_type: Option<&str>) -> &'sta
 }
 
 fn infer_waypoint_kind(tags: &Value) -> &'static str {
+    if let Some(value) = tag_str(tags, "emergency") {
+        return match value {
+            "phone" => "emergency_phone",
+            "first_aid_kit" => "first_aid_kit",
+            "defibrillator" => "defibrillator",
+            "mountain_rescue" => "mountain_rescue",
+            _ => "poi",
+        };
+    }
+
+    if let Some(value) = tag_str(tags, "amenity") {
+        return match value {
+            "shelter" => match tag_str(tags, "shelter_type") {
+                Some("basic_hut") => "basic_hut",
+                Some("weather_shelter") => "weather_shelter",
+                Some("lean_to") => "lean_to",
+                Some("rock_shelter") => "rock_shelter",
+                _ => "shelter",
+            },
+            "drinking_water" => "drinking_water",
+            "toilets" => "toilets",
+            "parking" => "parking",
+            "ranger_station" => "ranger_station",
+            "hospital" => "hospital",
+            "clinic" => "clinic",
+            _ => "poi",
+        };
+    }
+
+    if tag_str(tags, "highway") == Some("trailhead") {
+        return "trailhead";
+    }
+
     if let Some(value) = tag_str(tags, "tourism") {
         return match value {
             "alpine_hut" => "alpine_hut",
             "wilderness_hut" => "wilderness_hut",
             "camp_site" => "camp_site",
+            "viewpoint" => "viewpoint",
+            "picnic_site" => "picnic_site",
+            "information" => match tag_str(tags, "information") {
+                Some("guidepost") => "guidepost",
+                Some("map") => "information_map",
+                Some("board") => "information_board",
+                _ => "information",
+            },
             _ => "poi",
         };
     }
@@ -1299,8 +2139,19 @@ fn infer_waypoint_kind(tags: &Value) -> &'static str {
         return match value {
             "peak" => "peak",
             "spring" => "spring",
+            "waterfall" => "waterfall",
+            "cave_entrance" => "cave_entrance",
+            "saddle" => "saddle",
             _ => "poi",
         };
+    }
+
+    if tag_str(tags, "mountain_pass") == Some("yes") {
+        return "mountain_pass";
+    }
+
+    if tag_str(tags, "aerialway") == Some("station") {
+        return "aerialway_station";
     }
 
     "poi"
@@ -1322,23 +2173,47 @@ fn dedupe_preserve_order(items: Vec<String>) -> Vec<String> {
 fn feature_for_waypoint_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "camp_site" => Some("camping"),
-        "alpine_hut" | "wilderness_hut" => Some("huts"),
+        "alpine_hut" | "wilderness_hut" | "basic_hut" | "weather_shelter" | "lean_to"
+        | "rock_shelter" | "shelter" => Some("huts"),
         "peak" => Some("summit"),
         "spring" => Some("spring"),
+        "drinking_water" => Some("drinking_water"),
+        "mountain_rescue" | "ranger_station" | "emergency_phone" | "first_aid_kit"
+        | "defibrillator" | "hospital" | "clinic" => Some("emergency"),
+        "trailhead" => Some("trailhead"),
+        "viewpoint" => Some("viewpoint"),
+        "waterfall" => Some("waterfall"),
+        "cave_entrance" => Some("cave"),
+        "saddle" | "mountain_pass" => Some("pass"),
         _ => None,
     }
 }
 
 fn parse_elevation(raw: &str) -> Option<f64> {
-    let filtered: String = raw
-        .chars()
-        .filter(|ch| ch.is_ascii_digit() || *ch == '.' || *ch == '-')
-        .collect();
-
-    if filtered.is_empty() {
-        None
+    let normalized = raw.trim().to_ascii_lowercase().replace(',', "");
+    let (number, multiplier) = if let Some(value) = normalized
+        .strip_suffix("meters")
+        .or_else(|| normalized.strip_suffix("metres"))
+        .or_else(|| normalized.strip_suffix("meter"))
+        .or_else(|| normalized.strip_suffix("metre"))
+        .or_else(|| normalized.strip_suffix('m'))
+    {
+        (value, 1.0)
+    } else if let Some(value) = normalized
+        .strip_suffix("feet")
+        .or_else(|| normalized.strip_suffix("foot"))
+        .or_else(|| normalized.strip_suffix("ft"))
+    {
+        (value, 0.3048)
     } else {
-        filtered.parse().ok()
+        (normalized.as_str(), 1.0)
+    };
+
+    let elevation_m = number.trim().trim_start_matches('~').parse::<f64>().ok()? * multiplier;
+    if elevation_m.is_finite() && (-500.0..=9000.0).contains(&elevation_m) {
+        Some(elevation_m)
+    } else {
+        None
     }
 }
 
@@ -1360,7 +2235,23 @@ impl ElevationSampler {
         }
 
         let gdal_capabilities = detect_gdal_capabilities()?;
-        let dem_sources = load_raster_sources(&dem_paths)?;
+        let dem_sources = prioritize_raster_sources(load_raster_sources(&dem_paths)?);
+
+        tracing::info!(
+            dem_sources = dem_sources
+                .iter()
+                .map(|source| format!(
+                    "{}{}",
+                    source.path.display(),
+                    source
+                        .nominal_resolution_m
+                        .map(|resolution| format!(" ({resolution:.1}m)"))
+                        .unwrap_or_default()
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+            "prepared DEM source order"
+        );
 
         Ok(Some(Self {
             dem_sources,
@@ -1589,7 +2480,12 @@ fn probe_gdal_capabilities() -> Result<GdalCapabilities> {
         supports_interpolation_flag: version >= (3, 10),
     };
 
-    if capabilities.supports_batch_queries && !capabilities.supports_interpolation_flag {
+    if !capabilities.supports_batch_queries {
+        tracing::warn!(
+            gdal_version = stdout.trim(),
+            "GDAL < 3.9 lacks batched gdallocationinfo queries; elevation imports will be much slower. Upgrade to GDAL 3.10 or newer."
+        );
+    } else if !capabilities.supports_interpolation_flag {
         tracing::warn!(
             gdal_version = stdout.trim(),
             "GDAL does not support gdallocationinfo -r; raster sampling will use nearest-neighbor lookups"
@@ -1652,11 +2548,104 @@ fn load_raster_source(path: &PathBuf) -> Result<RasterSource> {
         .and_then(|bands| bands.first())
         .and_then(|band| band.get("noDataValue"))
         .and_then(Value::as_f64);
+    let bounds_wgs84 = parse_wgs84_bounds(&json);
+    let nominal_resolution_m = estimate_nominal_resolution_m(&json, bounds_wgs84);
 
     Ok(RasterSource {
         path: path.clone(),
         nodata_value,
+        bounds_wgs84,
+        nominal_resolution_m,
     })
+}
+
+fn prioritize_raster_sources(mut sources: Vec<RasterSource>) -> Vec<RasterSource> {
+    sources.sort_by(
+        |left, right| match (left.nominal_resolution_m, right.nominal_resolution_m) {
+            (Some(a), Some(b)) => a.total_cmp(&b).then_with(|| left.path.cmp(&right.path)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.path.cmp(&right.path),
+        },
+    );
+    sources
+}
+
+fn parse_wgs84_bounds(json: &Value) -> Option<RasterBounds> {
+    let rings = json
+        .get("wgs84Extent")
+        .and_then(|extent| extent.get("coordinates"))
+        .and_then(Value::as_array)?;
+
+    let mut min_lon = f64::INFINITY;
+    let mut min_lat = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
+    let mut saw_point = false;
+
+    for ring in rings {
+        let Some(points) = ring.as_array() else {
+            continue;
+        };
+        for point in points {
+            let Some(coords) = point.as_array() else {
+                continue;
+            };
+            let Some(lon) = coords.first().and_then(Value::as_f64) else {
+                continue;
+            };
+            let Some(lat) = coords.get(1).and_then(Value::as_f64) else {
+                continue;
+            };
+            min_lon = min_lon.min(lon);
+            min_lat = min_lat.min(lat);
+            max_lon = max_lon.max(lon);
+            max_lat = max_lat.max(lat);
+            saw_point = true;
+        }
+    }
+
+    if !saw_point {
+        return None;
+    }
+
+    Some(RasterBounds {
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+    })
+}
+
+fn estimate_nominal_resolution_m(json: &Value, bounds: Option<RasterBounds>) -> Option<f64> {
+    let bounds = bounds?;
+    let size = json.get("size")?.as_array()?;
+    let width = size.first().and_then(Value::as_u64)? as f64;
+    let height = size.get(1).and_then(Value::as_u64)? as f64;
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+
+    let center_lat_rad = ((bounds.min_lat + bounds.max_lat) / 2.0).to_radians();
+    let lon_m = (bounds.max_lon - bounds.min_lon).abs() * 111_320.0 * center_lat_rad.cos().abs();
+    let lat_m = (bounds.max_lat - bounds.min_lat).abs() * 110_574.0;
+    let x_res_m = lon_m / width;
+    let y_res_m = lat_m / height;
+    let nominal = x_res_m.max(y_res_m);
+
+    if nominal.is_finite() && nominal > 0.0 {
+        Some(nominal)
+    } else {
+        None
+    }
+}
+
+fn coord_in_bounds(coord: (f64, f64), bounds: RasterBounds) -> bool {
+    let tolerance = 1e-9;
+    coord.0 >= bounds.min_lon - tolerance
+        && coord.0 <= bounds.max_lon + tolerance
+        && coord.1 >= bounds.min_lat - tolerance
+        && coord.1 <= bounds.max_lat + tolerance
 }
 
 fn ordered_route_coordinates(
@@ -1832,6 +2821,25 @@ fn sample_raster_values_for_path(
     interpolation: &str,
     gdal_capabilities: GdalCapabilities,
 ) -> Result<Vec<Option<f64>>> {
+    let applicable_indexes = coords
+        .iter()
+        .enumerate()
+        .filter_map(|(index, coord)| {
+            if source
+                .bounds_wgs84
+                .is_some_and(|bounds| !coord_in_bounds(*coord, bounds))
+            {
+                None
+            } else {
+                Some(index)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if applicable_indexes.is_empty() {
+        return Ok(vec![None; coords.len()]);
+    }
+
     let mut command = Command::new("gdallocationinfo");
     command
         .arg("-valonly")
@@ -1861,7 +2869,8 @@ fn sample_raster_values_for_path(
             .stdin
             .take()
             .context("failed to open gdallocationinfo stdin")?;
-        for &(lon, lat) in coords {
+        for &coord_index in &applicable_indexes {
+            let (lon, lat) = coords[coord_index];
             writeln!(stdin, "{lon} {lat}").with_context(|| {
                 format!("writing coordinate batch for '{}'", source.path.display())
             })?;
@@ -1876,8 +2885,14 @@ fn sample_raster_values_for_path(
     })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if let Ok(values) = parse_gdallocationinfo_values(&stdout, coords.len(), source.nodata_value) {
-        return Ok(values);
+    if let Ok(values) =
+        parse_gdallocationinfo_values(&stdout, applicable_indexes.len(), source.nodata_value)
+    {
+        let mut resolved = vec![None; coords.len()];
+        for (offset, value) in values.into_iter().enumerate() {
+            resolved[applicable_indexes[offset]] = value;
+        }
+        return Ok(resolved);
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1890,12 +2905,19 @@ fn sample_raster_values_for_path(
         );
     }
 
-    parse_gdallocationinfo_values(&stdout, coords.len(), source.nodata_value).with_context(|| {
-        format!(
-            "parsing gdallocationinfo output from '{}'",
-            source.path.display()
-        )
-    })
+    let values =
+        parse_gdallocationinfo_values(&stdout, applicable_indexes.len(), source.nodata_value)
+            .with_context(|| {
+                format!(
+                    "parsing gdallocationinfo output from '{}'",
+                    source.path.display()
+                )
+            })?;
+    let mut resolved = vec![None; coords.len()];
+    for (offset, value) in values.into_iter().enumerate() {
+        resolved[applicable_indexes[offset]] = value;
+    }
+    Ok(resolved)
 }
 
 fn sample_single_raster_value(
@@ -1904,6 +2926,13 @@ fn sample_single_raster_value(
     interpolation: &str,
     gdal_capabilities: GdalCapabilities,
 ) -> Result<Option<f64>> {
+    if source
+        .bounds_wgs84
+        .is_some_and(|bounds| !coord_in_bounds(coord, bounds))
+    {
+        return Ok(None);
+    }
+
     let mut command = Command::new("gdallocationinfo");
     command.arg("-valonly").arg("-wgs84");
     if gdal_capabilities.supports_interpolation_flag {
@@ -2203,12 +3232,120 @@ pub(crate) fn approx_distance_m(a: (f64, f64), b: (f64, f64)) -> f64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn outdoor_waypoint_kinds_preserve_field_useful_semantics() {
+        assert_eq!(
+            infer_waypoint_kind(&serde_json::json!({ "amenity": "drinking_water" })),
+            "drinking_water"
+        );
+        assert_eq!(
+            infer_waypoint_kind(&serde_json::json!({ "natural": "spring" })),
+            "spring"
+        );
+        assert_eq!(
+            infer_waypoint_kind(&serde_json::json!({
+                "amenity": "shelter",
+                "shelter_type": "weather_shelter"
+            })),
+            "weather_shelter"
+        );
+        assert_eq!(
+            infer_waypoint_kind(&serde_json::json!({
+                "tourism": "information",
+                "information": "guidepost"
+            })),
+            "guidepost"
+        );
+        assert_eq!(
+            infer_waypoint_kind(&serde_json::json!({ "emergency": "phone" })),
+            "emergency_phone"
+        );
+        assert_eq!(
+            infer_waypoint_kind(&serde_json::json!({ "highway": "trailhead" })),
+            "trailhead"
+        );
+    }
+
+    #[test]
+    fn original_mapper_manifest_accepts_only_version_one_authorship() {
+        let manifest = parse_original_mapper_manifest(
+            br#"{
+                "schema_version": 1,
+                "relations": [{
+                    "osm_relation_id": 42,
+                    "osm_relation_version": 1,
+                    "display_name": "  Mapper  ",
+                    "provider_user_id": " 7 ",
+                    "profile_url": "https://www.openstreetmap.org/user/Mapper",
+                    "mapped_at": "2024-01-15T10:30:00Z"
+                }]
+            }"#,
+        )
+        .expect("valid version-one manifest");
+
+        assert_eq!(manifest.relations.len(), 1);
+        assert_eq!(manifest.relations[0].display_name, "Mapper");
+        assert_eq!(manifest.relations[0].provider_user_id.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn original_mapper_manifest_rejects_later_relation_versions() {
+        let error = parse_original_mapper_manifest(
+            br#"{
+                "schema_version": 1,
+                "relations": [{
+                    "osm_relation_id": 42,
+                    "osm_relation_version": 2,
+                    "display_name": "Latest editor",
+                    "mapped_at": "2024-01-15T10:30:00Z"
+                }]
+            }"#,
+        )
+        .expect_err("version two must not be called the original mapper");
+
+        assert!(error.to_string().contains("only relation version 1"));
+    }
+
+    #[test]
+    fn original_mapper_manifest_rejects_duplicate_relations() {
+        let error = parse_original_mapper_manifest(
+            br#"{
+                "schema_version": 1,
+                "relations": [
+                    {
+                        "osm_relation_id": 42,
+                        "osm_relation_version": 1,
+                        "display_name": "Mapper",
+                        "mapped_at": "2024-01-15T10:30:00Z"
+                    },
+                    {
+                        "osm_relation_id": 42,
+                        "osm_relation_version": 1,
+                        "display_name": "Mapper",
+                        "mapped_at": "2024-01-15T10:30:00Z"
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("duplicate relation ids must be rejected");
+
+        assert!(error.to_string().contains("more than once"));
+    }
+
     fn raw_way(osm_id: i64, geom_wkb: Vec<u8>) -> RawWayRow {
         RawWayRow {
             osm_id,
             tags: serde_json::json!({ "highway": "path" }),
             geom_wkb,
             length_m: 100.0,
+        }
+    }
+
+    fn raw_relation(osm_id: i64, tags: Value, members: Vec<RawRelationMember>) -> RawRelationRow {
+        RawRelationRow {
+            osm_id,
+            tags,
+            members: Json(members),
         }
     }
 
@@ -2225,10 +3362,10 @@ mod tests {
         let (prepared_by_id, lookup) = prepare_way_maps(vec![row]).expect("prepare way maps");
         let relation_lookup = HashMap::from([(
             100,
-            RawRelationRow {
-                osm_id: 100,
-                tags: serde_json::json!({ "name": "dup route" }),
-                members: Json(vec![
+            raw_relation(
+                100,
+                serde_json::json!({ "name": "dup route" }),
+                vec![
                     RawRelationMember {
                         kind: "w".to_string(),
                         ref_id: 42,
@@ -2239,8 +3376,8 @@ mod tests {
                         ref_id: 42,
                         role: String::new(),
                     },
-                ]),
-            },
+                ],
+            ),
         )]);
 
         let build = build_relation_way_records(
@@ -2271,10 +3408,10 @@ mod tests {
         let relation_lookup = HashMap::from([
             (
                 200,
-                RawRelationRow {
-                    osm_id: 200,
-                    tags: serde_json::json!({ "name": "child route" }),
-                    members: Json(vec![
+                raw_relation(
+                    200,
+                    serde_json::json!({ "name": "child route" }),
+                    vec![
                         RawRelationMember {
                             kind: "w".to_string(),
                             ref_id: 1,
@@ -2285,20 +3422,20 @@ mod tests {
                             ref_id: 2,
                             role: String::new(),
                         },
-                    ]),
-                },
+                    ],
+                ),
             ),
             (
                 201,
-                RawRelationRow {
-                    osm_id: 201,
-                    tags: serde_json::json!({ "name": "parent route" }),
-                    members: Json(vec![RawRelationMember {
+                raw_relation(
+                    201,
+                    serde_json::json!({ "name": "parent route" }),
+                    vec![RawRelationMember {
                         kind: "r".to_string(),
                         ref_id: 200,
                         role: "backward".to_string(),
-                    }]),
-                },
+                    }],
+                ),
             ),
         ]);
 
@@ -2339,10 +3476,10 @@ mod tests {
         let (prepared_by_id, _) = prepare_way_maps(rows).expect("prepare way maps");
         let relation_lookup = HashMap::from([(
             300,
-            RawRelationRow {
-                osm_id: 300,
-                tags: serde_json::json!({ "name": "appendix route" }),
-                members: Json(vec![
+            raw_relation(
+                300,
+                serde_json::json!({ "name": "appendix route" }),
+                vec![
                     RawRelationMember {
                         kind: "w".to_string(),
                         ref_id: 1,
@@ -2353,8 +3490,8 @@ mod tests {
                         ref_id: 2,
                         role: "alternative".to_string(),
                     },
-                ]),
-            },
+                ],
+            ),
         )]);
 
         let build = build_relation_way_records(
@@ -2393,6 +3530,19 @@ mod tests {
                 "missing member".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parse_elevation_handles_common_units() {
+        assert_eq!(parse_elevation("6,932 m"), Some(6932.0));
+        assert_eq!(parse_elevation("12000 ft"), Some(3657.6000000000004));
+        assert_eq!(parse_elevation("~4200 metres"), Some(4200.0));
+    }
+
+    #[test]
+    fn parse_elevation_rejects_ranges_and_impossible_values() {
+        assert_eq!(parse_elevation("6353-6362"), None);
+        assert_eq!(parse_elevation("99999"), None);
     }
 
     #[test]
@@ -2489,5 +3639,95 @@ mod tests {
     fn nodata_matches_allows_small_rounding_error() {
         assert!(nodata_matches(-1234.5678904, Some(-1234.5678901)));
         assert!(!nodata_matches(-1234.56, Some(-1234.5678901)));
+    }
+
+    #[test]
+    fn parse_wgs84_bounds_reads_extent_polygon() {
+        let json = serde_json::json!({
+            "wgs84Extent": {
+                "coordinates": [[
+                    [77.0, 32.0],
+                    [78.0, 32.0],
+                    [78.0, 33.0],
+                    [77.0, 33.0],
+                    [77.0, 32.0]
+                ]]
+            }
+        });
+
+        let bounds = parse_wgs84_bounds(&json).expect("parse bounds");
+
+        assert_eq!(
+            bounds,
+            RasterBounds {
+                min_lon: 77.0,
+                min_lat: 32.0,
+                max_lon: 78.0,
+                max_lat: 33.0,
+            }
+        );
+    }
+
+    #[test]
+    fn estimate_nominal_resolution_uses_wgs84_extent_and_size() {
+        let json = serde_json::json!({
+            "size": [3600, 3600]
+        });
+        let bounds = RasterBounds {
+            min_lon: 77.0,
+            min_lat: 32.0,
+            max_lon: 78.0,
+            max_lat: 33.0,
+        };
+
+        let resolution = estimate_nominal_resolution_m(&json, Some(bounds)).expect("resolution");
+
+        assert!(resolution > 20.0);
+        assert!(resolution < 40.0);
+    }
+
+    #[test]
+    fn prioritize_raster_sources_prefers_finer_resolution() {
+        let sources = vec![
+            RasterSource {
+                path: PathBuf::from("coarse.tif"),
+                nodata_value: None,
+                bounds_wgs84: None,
+                nominal_resolution_m: Some(30.0),
+            },
+            RasterSource {
+                path: PathBuf::from("fine.tif"),
+                nodata_value: None,
+                bounds_wgs84: None,
+                nominal_resolution_m: Some(8.0),
+            },
+            RasterSource {
+                path: PathBuf::from("unknown.tif"),
+                nodata_value: None,
+                bounds_wgs84: None,
+                nominal_resolution_m: None,
+            },
+        ];
+
+        let prioritized = prioritize_raster_sources(sources);
+        let ordered = prioritized
+            .iter()
+            .map(|source| source.path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered, vec!["fine.tif", "coarse.tif", "unknown.tif"]);
+    }
+
+    #[test]
+    fn coord_in_bounds_accepts_points_inside_extent() {
+        let bounds = RasterBounds {
+            min_lon: 77.0,
+            min_lat: 32.0,
+            max_lon: 78.0,
+            max_lat: 33.0,
+        };
+
+        assert!(coord_in_bounds((77.4, 32.5), bounds));
+        assert!(!coord_in_bounds((78.4, 32.5), bounds));
     }
 }

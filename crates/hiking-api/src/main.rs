@@ -1,7 +1,9 @@
 use actix_web::{get, http::header, web, App, HttpResponse, HttpServer};
+use chrono::{DateTime, Utc};
 use hiking_db::models::ElevationPoint;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
+use std::collections::HashMap;
 use std::fmt::Display;
 use tokio::try_join;
 use uuid::Uuid;
@@ -23,6 +25,7 @@ struct TrailSummary {
 struct TrailDetailRow {
     id: Uuid,
     region_id: Option<Uuid>,
+    region_country_code: Option<String>,
     name: Option<String>,
     network: Option<String>,
     difficulty: Option<String>,
@@ -42,6 +45,12 @@ struct TrailDetailRow {
     route_via: Option<String>,
     website_url: Option<String>,
     video_url: Option<String>,
+    original_mapper_name: Option<String>,
+    original_mapper_provider: Option<String>,
+    original_mapper_user_id: Option<String>,
+    original_mapper_profile_url: Option<String>,
+    original_mapped_at: Option<DateTime<Utc>>,
+    original_mapper_source: Option<String>,
     geometry_geojson: Option<String>,
     start_point_geojson: Option<String>,
     end_point_geojson: Option<String>,
@@ -77,9 +86,13 @@ struct StitchWarningRow {
     message: String,
 }
 
-#[derive(Debug, Serialize, FromRow)]
-struct RegionBreadcrumbRow {
-    name: String,
+#[derive(Debug, FromRow)]
+struct CountryBoundsRow {
+    country_code: String,
+    min_lon: Option<f64>,
+    min_lat: Option<f64>,
+    max_lon: Option<f64>,
+    max_lat: Option<f64>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -108,10 +121,92 @@ struct TrailListQuery {
     offset: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+    limit: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 struct TrailWarningPayload {
     kind: String,
     message: String,
+}
+
+#[derive(Debug, FromRow)]
+struct SearchTrailRow {
+    id: Uuid,
+    name: Option<String>,
+    network: Option<String>,
+    distance_m: Option<f64>,
+    region_id: Option<Uuid>,
+    region_country_code: Option<String>,
+    route_from: Option<String>,
+    route_to: Option<String>,
+    route_via: Option<String>,
+    summary: Option<String>,
+    _score: f64,
+}
+
+#[derive(Debug, FromRow)]
+struct SearchRegionRow {
+    id: Uuid,
+    name: String,
+    admin_level: Option<i16>,
+    country_code: Option<String>,
+    min_lon: Option<f64>,
+    min_lat: Option<f64>,
+    max_lon: Option<f64>,
+    max_lat: Option<f64>,
+    _score: f64,
+}
+
+#[derive(Debug, FromRow)]
+struct SearchPlaceRow {
+    id: Uuid,
+    name: String,
+    place_kind: String,
+    region_id: Option<Uuid>,
+    country_code: Option<String>,
+    lon: f64,
+    lat: f64,
+    _score: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchRouteResult {
+    kind: &'static str,
+    id: Uuid,
+    name: String,
+    network: Option<String>,
+    distance_m: Option<f64>,
+    subtitle: Option<String>,
+    breadcrumb: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchPlaceResult {
+    kind: &'static str,
+    id: String,
+    name: String,
+    place_kind: Option<String>,
+    admin_label: Option<String>,
+    breadcrumb: Vec<String>,
+    bbox: Option<[f64; 4]>,
+    center: Option<[f64; 2]>,
+}
+
+#[derive(Debug)]
+struct SearchCountryRow {
+    country_code: String,
+    bbox: Option<[f64; 4]>,
+    score: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    routes: Vec<SearchRouteResult>,
+    places: Vec<SearchPlaceResult>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -227,6 +322,155 @@ fn list_limit(query: &TrailListQuery) -> i64 {
 
 fn list_offset(query: &TrailListQuery) -> i64 {
     query.offset.unwrap_or(0).max(0)
+}
+
+fn search_limit(query: &SearchQuery) -> i64 {
+    query.limit.unwrap_or(12).clamp(1, 20)
+}
+
+fn admin_level_label(country_code: Option<&str>, admin_level: Option<i16>) -> Option<&'static str> {
+    if country_code == Some("IN") {
+        return match admin_level {
+            Some(2) => Some("Country"),
+            Some(4) => Some("State"),
+            Some(5) => Some("District"),
+            Some(6) => Some("Subdistrict"),
+            Some(7) => Some("Local area"),
+            Some(8) => Some("Local area"),
+            _ => None,
+        };
+    }
+
+    match admin_level {
+        Some(2) => Some("Country"),
+        Some(3) => Some("Region"),
+        Some(4) => Some("State or province"),
+        Some(5) => Some("Division"),
+        Some(6) => Some("District"),
+        Some(7) => Some("Subdistrict"),
+        Some(8) => Some("Local area"),
+        _ => None,
+    }
+}
+
+fn country_name_for_code(code: &str) -> Option<&'static str> {
+    match code {
+        "IN" => Some("India"),
+        "NP" => Some("Nepal"),
+        "BT" => Some("Bhutan"),
+        "PK" => Some("Pakistan"),
+        "CN" => Some("China"),
+        _ => None,
+    }
+}
+
+fn prepend_country_to_breadcrumb(path: &mut Vec<String>, country_code: Option<&str>) {
+    let Some(country_name) = country_code.and_then(country_name_for_code) else {
+        return;
+    };
+
+    if path.first().map(String::as_str) == Some(country_name) {
+        return;
+    }
+
+    path.retain(|entry| entry != country_name);
+    path.insert(0, country_name.to_string());
+}
+
+fn country_match_score(code: &str, term: &str) -> f64 {
+    let normalized_term = term.trim().to_ascii_lowercase();
+    if normalized_term.is_empty() {
+        return 0.0;
+    }
+
+    let normalized_code = code.to_ascii_lowercase();
+    let normalized_name = country_name_for_code(code)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| normalized_code.clone());
+
+    if normalized_term == normalized_name {
+        return 1200.0;
+    }
+
+    if normalized_term == normalized_code {
+        return 1100.0;
+    }
+
+    if normalized_name.starts_with(&normalized_term) {
+        return 930.0;
+    }
+
+    if normalized_code.starts_with(&normalized_term) {
+        return 840.0;
+    }
+
+    if normalized_name.contains(&normalized_term) {
+        return 760.0;
+    }
+
+    if normalized_code.contains(&normalized_term) {
+        return 680.0;
+    }
+
+    0.0
+}
+
+#[derive(Debug, FromRow)]
+struct RegionChainRow {
+    root_id: Uuid,
+    name: String,
+    _depth: i32,
+}
+
+async fn fetch_region_paths(
+    pool: &PgPool,
+    region_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<String>>, sqlx::Error> {
+    if region_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query_as::<_, RegionChainRow>(
+        r#"
+        WITH RECURSIVE seed AS (
+            SELECT DISTINCT unnest($1::uuid[]) AS root_id
+        ),
+        chain AS (
+            SELECT seed.root_id, regions.id, regions.name, regions.parent_region_id, 0 AS depth
+            FROM seed
+            JOIN regions ON regions.id = seed.root_id
+
+            UNION ALL
+
+            SELECT chain.root_id, parent.id, parent.name, parent.parent_region_id, chain.depth + 1
+            FROM chain
+            JOIN regions parent ON parent.id = chain.parent_region_id
+        )
+        SELECT root_id, name, depth AS _depth
+        FROM chain
+        ORDER BY root_id, depth DESC
+        "#,
+    )
+    .bind(region_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut paths = HashMap::<Uuid, Vec<String>>::new();
+    for row in rows {
+        paths.entry(row.root_id).or_default().push(row.name);
+    }
+
+    for path in paths.values_mut() {
+        let mut deduped = Vec::with_capacity(path.len());
+        for name in path.drain(..) {
+            if deduped.last() != Some(&name) {
+                deduped.push(name);
+            }
+        }
+        *path = deduped;
+    }
+
+    Ok(paths)
 }
 
 fn classify_warning_kind(message: &str) -> &'static str {
@@ -584,6 +828,329 @@ async fn list_trails_in_region(
     Ok(HttpResponse::Ok().json(trails))
 }
 
+#[get("/search")]
+async fn search(
+    pool: web::Data<PgPool>,
+    query: web::Query<SearchQuery>,
+) -> actix_web::Result<HttpResponse> {
+    let query = query.into_inner();
+    let raw_term = query.q.clone().unwrap_or_default();
+    let term = raw_term.trim();
+
+    if term.is_empty() {
+        return Ok(HttpResponse::Ok().json(SearchResponse {
+            routes: Vec::new(),
+            places: Vec::new(),
+        }));
+    }
+
+    let route_rows = sqlx::query_as::<_, SearchTrailRow>(
+        r#"
+        SELECT
+            id,
+            name,
+            network,
+            distance_m,
+            region_id,
+            region_country_code,
+            tags->>'from' AS route_from,
+            tags->>'to' AS route_to,
+            tags->>'via' AS route_via,
+            summary,
+            _score
+        FROM (
+            SELECT
+                trails.id,
+                trails.name,
+                trails.network,
+                trails.distance_m,
+                trails.region_id,
+                regions.country_code AS region_country_code,
+                raw.tags,
+                trails.summary,
+                (
+                    CASE
+                        WHEN lower(COALESCE(trails.name, '')) = lower($1) THEN 1000
+                        WHEN lower(COALESCE(trails.name, '')) LIKE lower($1) || '%' THEN 850
+                        WHEN COALESCE(trails.name, '') ILIKE '%' || $1 || '%' THEN 700
+                        WHEN COALESCE(raw.tags->>'from', '') ILIKE '%' || $1 || '%' THEN 560
+                        WHEN COALESCE(raw.tags->>'to', '') ILIKE '%' || $1 || '%' THEN 560
+                        WHEN COALESCE(raw.tags->>'via', '') ILIKE '%' || $1 || '%' THEN 540
+                        WHEN COALESCE(trails.summary, '') ILIKE '%' || $1 || '%' THEN 480
+                        ELSE 0
+                    END
+                    + (
+                        GREATEST(
+                            similarity(COALESCE(trails.name, ''), $1),
+                            similarity(COALESCE(raw.tags->>'from', ''), $1),
+                            similarity(COALESCE(raw.tags->>'to', ''), $1),
+                            similarity(COALESCE(raw.tags->>'via', ''), $1),
+                            similarity(COALESCE(trails.summary, ''), $1)
+                        ) * 100
+                    )
+                ) AS _score
+            FROM trails
+            LEFT JOIN raw_relations raw ON raw.osm_id = trails.osm_relation_id
+            LEFT JOIN regions ON regions.id = trails.region_id
+            WHERE
+                COALESCE(trails.name, '') ILIKE '%' || $1 || '%'
+                OR COALESCE(trails.summary, '') ILIKE '%' || $1 || '%'
+                OR COALESCE(raw.tags->>'from', '') ILIKE '%' || $1 || '%'
+                OR COALESCE(raw.tags->>'to', '') ILIKE '%' || $1 || '%'
+                OR COALESCE(raw.tags->>'via', '') ILIKE '%' || $1 || '%'
+                OR similarity(COALESCE(trails.name, ''), $1) > 0.2
+        ) matches
+        ORDER BY _score DESC, name NULLS LAST
+        LIMIT $2
+        "#,
+    )
+    .bind(term)
+    .bind(search_limit(&query))
+    .fetch_all(pool.get_ref())
+    .await
+    .map_err(|error| internal_error("searching trails", error))?;
+
+    let region_rows = sqlx::query_as::<_, SearchRegionRow>(
+        r#"
+        SELECT
+            id,
+            name,
+            admin_level,
+            country_code,
+            ST_XMin(ST_Envelope(boundary)) AS min_lon,
+            ST_YMin(ST_Envelope(boundary)) AS min_lat,
+            ST_XMax(ST_Envelope(boundary)) AS max_lon,
+            ST_YMax(ST_Envelope(boundary)) AS max_lat,
+            (
+                CASE
+                    WHEN lower(name) = lower($1) THEN 1100
+                    WHEN lower(name) LIKE lower($1) || '%' THEN 920
+                    WHEN name ILIKE '%' || $1 || '%' THEN 760
+                    ELSE 0
+                END
+                + similarity(name, $1) * 100
+            ) AS _score
+        FROM regions
+        WHERE
+            name ILIKE '%' || $1 || '%'
+            OR similarity(name, $1) > 0.2
+        ORDER BY _score DESC, name
+        LIMIT $2
+        "#,
+    )
+    .bind(term)
+    .bind(search_limit(&query))
+    .fetch_all(pool.get_ref())
+    .await
+    .map_err(|error| internal_error("searching regions", error))?;
+
+    let place_rows = sqlx::query_as::<_, SearchPlaceRow>(
+        r#"
+        SELECT
+            id,
+            name,
+            place_kind,
+            region_id,
+            country_code,
+            ST_X(geom) AS lon,
+            ST_Y(geom) AS lat,
+            (
+                CASE
+                    WHEN lower(name) = lower($1) THEN 1050
+                    WHEN lower(name) LIKE lower($1) || '%' THEN 880
+                    WHEN name ILIKE '%' || $1 || '%' THEN 720
+                    ELSE 0
+                END
+                + similarity(name, $1) * 100
+            ) AS _score
+        FROM places
+        WHERE
+            name ILIKE '%' || $1 || '%'
+            OR similarity(name, $1) > 0.2
+        ORDER BY _score DESC, name
+        LIMIT $2
+        "#,
+    )
+    .bind(term)
+    .bind(search_limit(&query))
+    .fetch_all(pool.get_ref())
+    .await
+    .map_err(|error| internal_error("searching places", error))?;
+
+    let country_bbox_rows = sqlx::query_as::<_, CountryBoundsRow>(
+        r#"
+        SELECT
+            country_code,
+            MIN(ST_XMin(ST_Envelope(boundary))) AS min_lon,
+            MIN(ST_YMin(ST_Envelope(boundary))) AS min_lat,
+            MAX(ST_XMax(ST_Envelope(boundary))) AS max_lon,
+            MAX(ST_YMax(ST_Envelope(boundary))) AS max_lat
+        FROM regions
+        WHERE country_code IS NOT NULL
+        GROUP BY country_code
+        "#,
+    )
+    .fetch_all(pool.get_ref())
+    .await
+    .map_err(|error| internal_error("loading country search candidates", error))?;
+
+    let country_rows = country_bbox_rows
+        .into_iter()
+        .filter_map(|row| {
+            let country_code = row.country_code;
+            let score = country_match_score(&country_code, term);
+            if score <= 0.0 {
+                return None;
+            }
+
+            Some(SearchCountryRow {
+                country_code,
+                bbox: match (row.min_lon, row.min_lat, row.max_lon, row.max_lat) {
+                    (Some(min_lon), Some(min_lat), Some(max_lon), Some(max_lat)) => {
+                        Some([min_lon, min_lat, max_lon, max_lat])
+                    }
+                    _ => None,
+                },
+                score,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut region_ids = route_rows
+        .iter()
+        .filter_map(|row| row.region_id)
+        .chain(region_rows.iter().map(|row| row.id))
+        .chain(place_rows.iter().filter_map(|row| row.region_id))
+        .collect::<Vec<_>>();
+    region_ids.sort_unstable();
+    region_ids.dedup();
+
+    let region_paths = fetch_region_paths(pool.get_ref(), &region_ids)
+        .await
+        .map_err(|error| internal_error("building search breadcrumbs", error))?;
+
+    let routes = route_rows
+        .into_iter()
+        .map(|row| {
+            let mut breadcrumb = row
+                .region_id
+                .and_then(|region_id| region_paths.get(&region_id).cloned())
+                .unwrap_or_default();
+            prepend_country_to_breadcrumb(&mut breadcrumb, row.region_country_code.as_deref());
+
+            let route_line = [row.route_from, row.route_via, row.route_to]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let route_subtitle = if route_line.is_empty() {
+                None
+            } else {
+                Some(route_line.join(" -> "))
+            };
+
+            SearchRouteResult {
+                kind: "trail",
+                id: row.id,
+                name: row.name.unwrap_or_else(|| "Unnamed".to_string()),
+                network: row.network,
+                distance_m: row.distance_m,
+                subtitle: if breadcrumb.is_empty() {
+                    route_subtitle.or(row.summary)
+                } else {
+                    Some(breadcrumb.join(", "))
+                },
+                breadcrumb,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut places = region_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row._score,
+                SearchPlaceResult {
+                    kind: "region",
+                    id: row.id.to_string(),
+                    name: row.name,
+                    place_kind: None,
+                    admin_label: admin_level_label(row.country_code.as_deref(), row.admin_level)
+                        .map(str::to_string),
+                    breadcrumb: {
+                        let mut full_path = region_paths.get(&row.id).cloned().unwrap_or_default();
+                        prepend_country_to_breadcrumb(&mut full_path, row.country_code.as_deref());
+                        if full_path.is_empty() {
+                            Vec::new()
+                        } else {
+                            full_path[..full_path.len().saturating_sub(1)].to_vec()
+                        }
+                    },
+                    bbox: match (row.min_lon, row.min_lat, row.max_lon, row.max_lat) {
+                        (Some(min_lon), Some(min_lat), Some(max_lon), Some(max_lat)) => {
+                            Some([min_lon, min_lat, max_lon, max_lat])
+                        }
+                        _ => None,
+                    },
+                    center: None,
+                },
+            )
+        })
+        .chain(country_rows.into_iter().map(|row| {
+            (
+                row.score,
+                SearchPlaceResult {
+                    kind: "region",
+                    id: format!("country:{}", row.country_code),
+                    name: country_name_for_code(&row.country_code)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| row.country_code.clone()),
+                    place_kind: None,
+                    admin_label: Some("Country".to_string()),
+                    breadcrumb: Vec::new(),
+                    bbox: row.bbox,
+                    center: None,
+                },
+            )
+        }))
+        .chain(place_rows.into_iter().map(|row| {
+            let mut breadcrumb = row
+                .region_id
+                .and_then(|region_id| region_paths.get(&region_id).cloned())
+                .unwrap_or_default();
+            prepend_country_to_breadcrumb(&mut breadcrumb, row.country_code.as_deref());
+
+            (
+                row._score,
+                SearchPlaceResult {
+                    kind: "place",
+                    id: row.id.to_string(),
+                    name: row.name,
+                    place_kind: Some(row.place_kind.replace('_', " ")),
+                    admin_label: None,
+                    breadcrumb,
+                    bbox: None,
+                    center: Some([row.lon, row.lat]),
+                },
+            )
+        }))
+        .collect::<Vec<_>>();
+
+    places.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let places = places
+        .into_iter()
+        .map(|(_, result)| result)
+        .take(search_limit(&query) as usize)
+        .collect::<Vec<_>>();
+
+    Ok(HttpResponse::Ok().json(SearchResponse { routes, places }))
+}
+
 #[get("/trails/{trail_id}")]
 async fn get_trail(
     pool: web::Data<PgPool>,
@@ -594,20 +1161,21 @@ async fn get_trail(
     let row = sqlx::query_as::<_, TrailDetailRow>(
         r#"
         SELECT
-            id,
-            region_id,
-            name,
-            network,
-            difficulty,
-            distance_m,
-            ascent_m,
-            descent_m,
-            summary,
-            hike_type,
-            estimated_duration_min,
-            default_direction_mode,
-            direction_source,
-            source_kind,
+            trails.id,
+            trails.region_id,
+            regions.country_code AS region_country_code,
+            trails.name,
+            trails.network,
+            trails.difficulty,
+            trails.distance_m,
+            trails.ascent_m,
+            trails.descent_m,
+            trails.summary,
+            trails.hike_type,
+            trails.estimated_duration_min,
+            trails.default_direction_mode,
+            trails.direction_source,
+            trails.source_kind,
             raw.tags->>'network:type' AS network_type,
             raw.tags->>'tag' AS route_tag,
             raw.tags->>'from' AS route_from,
@@ -615,12 +1183,19 @@ async fn get_trail(
             raw.tags->>'via' AS route_via,
             raw.tags->>'website' AS website_url,
             raw.tags->>'video' AS video_url,
+            trails.original_mapper_name,
+            trails.original_mapper_provider,
+            trails.original_mapper_user_id,
+            trails.original_mapper_profile_url,
+            trails.original_mapped_at,
+            trails.original_mapper_source,
             ST_AsGeoJSON(trails.geom) AS geometry_geojson,
             ST_AsGeoJSON(start_point) AS start_point_geojson,
             ST_AsGeoJSON(end_point) AS end_point_geojson
         FROM trails
         LEFT JOIN raw_relations raw ON raw.osm_id = trails.osm_relation_id
-        WHERE id = $1
+        LEFT JOIN regions ON regions.id = trails.region_id
+        WHERE trails.id = $1
         "#,
     )
     .bind(trail_id)
@@ -739,32 +1314,16 @@ async fn get_trail(
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let region_breadcrumb = if let Some(region_id) = row.region_id {
-        sqlx::query_as::<_, RegionBreadcrumbRow>(
-            r#"
-            WITH RECURSIVE chain AS (
-                SELECT id, name, parent_region_id, 0 AS depth
-                FROM regions
-                WHERE id = $1
-
-                UNION ALL
-
-                SELECT regions.id, regions.name, regions.parent_region_id, chain.depth + 1
-                FROM regions
-                JOIN chain ON chain.parent_region_id = regions.id
-            )
-            SELECT name
-            FROM chain
-            ORDER BY depth DESC
-            "#,
-        )
-        .bind(region_id)
-        .fetch_all(pool.get_ref())
-        .await
-        .map_err(|error| internal_error("fetching region breadcrumb", error))?
+    let mut region_breadcrumb = if let Some(region_id) = row.region_id {
+        fetch_region_paths(pool.get_ref(), &[region_id])
+            .await
+            .map_err(|error| internal_error("fetching region breadcrumb", error))?
+            .remove(&region_id)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
+    prepend_country_to_breadcrumb(&mut region_breadcrumb, row.region_country_code.as_deref());
 
     let structured_warnings = warnings
         .into_iter()
@@ -795,10 +1354,16 @@ async fn get_trail(
         "route_via": row.route_via,
         "website_url": row.website_url,
         "video_url": row.video_url,
+        "original_mapper_name": row.original_mapper_name,
+        "original_mapper_provider": row.original_mapper_provider,
+        "original_mapper_user_id": row.original_mapper_user_id,
+        "original_mapper_profile_url": row.original_mapper_profile_url,
+        "original_mapped_at": row.original_mapped_at,
+        "original_mapper_source": row.original_mapper_source,
         "geometry": geometry,
         "start_point": start_point,
         "end_point": end_point,
-        "region_breadcrumb": region_breadcrumb.into_iter().map(|item| item.name).collect::<Vec<_>>(),
+        "region_breadcrumb": region_breadcrumb,
         "surfaces": surfaces,
         "features": features.into_iter().map(|item| item.feature_slug).collect::<Vec<_>>(),
         "waypoints": waypoints,
@@ -922,6 +1487,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(pool.clone()))
             .service(health)
+            .service(search)
             .service(list_trails_in_region)
             .service(get_trail)
             .service(get_elevation)
@@ -930,4 +1496,16 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", 8080))?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn india_admin_levels_use_local_search_labels() {
+        assert_eq!(admin_level_label(Some("IN"), Some(4)), Some("State"));
+        assert_eq!(admin_level_label(Some("IN"), Some(5)), Some("District"));
+        assert_eq!(admin_level_label(Some("IN"), Some(6)), Some("Subdistrict"));
+    }
 }

@@ -53,6 +53,7 @@ yarn-error.log*
 /data/*
 !/data/.gitkeep
 !/data/README.md
+!/data/original_mappers.example.json
 
 # Common local raster / terrain working dirs
 /data/dem_tiles/
