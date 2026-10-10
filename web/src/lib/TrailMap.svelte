@@ -77,7 +77,7 @@
 		setSlopeVisible
 	} from './terrain-layers';
 	import { TerrainControls, LayersPanel } from './components/controls';
-	import { TrailDetailPanel, FeaturePanel } from './components/sidebar';
+	import { TrailDetailPanel, FeaturePanel, SearchPanel } from './components/sidebar';
 	import { MapControls, Map3DView } from './components/map';
 
 	const INITIAL_CENTER: [number, number] = [77.18, 32.24];
@@ -3284,103 +3284,25 @@
 		</div>
 	</div>
 
-		<div class:panel-open={detailPanelOpen} class="search-dock">
-		<div class:open={searchPanelOpen} class="search-card">
-			<div class="search-input-wrap">
-				<span class="search-icon" aria-hidden="true">⌕</span>
-				<input
-					bind:this={searchInput}
-					class="search-input"
-					aria-label="Search trails or places"
-					type="search"
-					placeholder={mapVisualReady ? 'Search trails or places…' : 'Preparing map search…'}
-					disabled={!mapVisualReady}
-					value={searchQuery}
-					oninput={handleSearchInput}
-					onfocus={openSearchPanel}
-					onkeydown={handleSearchKeydown}
-				/>
-				{#if searchQuery}
-					<button class="search-clear" type="button" aria-label="Clear search" onclick={resetSearch}>
-						×
-					</button>
-				{/if}
-			</div>
-
-			{#if searchPanelOpen}
-				<div class="search-results">
-					{#if searchQuery.trim().length < SEARCH_MIN_CHARS}
-						<p class="search-hint">Type at least {SEARCH_MIN_CHARS} characters to search trails and areas.</p>
-					{:else if searchLoading}
-						<p class="search-hint">Searching the trail index…</p>
-					{:else if searchError}
-						<p class="search-error">{searchError}</p>
-					{:else if searchResults.length === 0}
-						<p class="search-hint">No matches yet. Try a trail name or a place like Manali.</p>
-					{:else}
-						<div class="search-result-list">
-							{#if searchRoutes.length > 0}
-								<div class="search-group-label">Trails</div>
-								{#each searchRoutes as result}
-									<button
-										class:active={searchResults[activeSearchIndex]?.id === result.id}
-										class="search-result"
-										type="button"
-										onmouseenter={() => (activeSearchIndex = searchResults.findIndex((item) => item.id === result.id))}
-										onfocus={() => (activeSearchIndex = searchResults.findIndex((item) => item.id === result.id))}
-										onclick={() => selectSearchResult(result)}
-									>
-										<div class="search-result-topline">
-											<span class="search-kind-pill">Trail</span>
-											{#if result.network}
-												<span class="search-network">{result.network}</span>
-											{/if}
-											{#if result.distance_m != null}
-												<span class="search-distance">{formatDistance(result.distance_m)}</span>
-											{/if}
-										</div>
-										<strong>{result.name}</strong>
-										{#if result.subtitle}
-											<p>{result.subtitle}</p>
-										{/if}
-									</button>
-								{/each}
-							{/if}
-
-							{#if searchPlaces.length > 0}
-								<div class="search-group-label">Places</div>
-								{#each searchPlaces as result}
-									<button
-										class:active={searchResults[activeSearchIndex]?.id === result.id}
-										class="search-result"
-										type="button"
-										onmouseenter={() => (activeSearchIndex = searchResults.findIndex((item) => item.id === result.id))}
-										onfocus={() => (activeSearchIndex = searchResults.findIndex((item) => item.id === result.id))}
-										onclick={() => selectSearchResult(result)}
-									>
-										<div class="search-result-topline">
-											<span class:region-pill={result.kind === 'region'} class="search-kind-pill">
-												{result.kind === 'region' ? 'Area' : 'Place'}
-											</span>
-											{#if result.admin_label}
-												<span class="search-network">{result.admin_label}</span>
-											{:else if result.place_kind}
-												<span class="search-network">{result.place_kind}</span>
-											{/if}
-										</div>
-										<strong>{result.name}</strong>
-										{#if result.breadcrumb.length > 0}
-											<p>{result.breadcrumb.join(', ')}</p>
-										{/if}
-									</button>
-								{/each}
-							{/if}
-						</div>
-					{/if}
-				</div>
-			{/if}
-		</div>
-	</div>
+	<SearchPanel
+		query={searchQuery}
+		panelOpen={searchPanelOpen}
+		isLoading={searchLoading}
+		isError={!!searchError}
+		errorMessage={searchError}
+		searchResults={searchResults}
+		searchRoutes={searchRoutes}
+		searchPlaces={searchPlaces}
+		activeSearchIndex={activeSearchIndex}
+		mapReady={mapVisualReady}
+		minChars={SEARCH_MIN_CHARS}
+		detailPanelOpen={detailPanelOpen}
+		onInput={handleSearchInput}
+		onFocus={openSearchPanel}
+		onKeydown={handleSearchKeydown}
+		onSelectResult={selectSearchResult}
+		onReset={resetSearch}
+	/>
 
 	<TrailDiscovery bounds={discoveryBounds} hidden={detailPanelOpen || searchPanelOpen || !mapVisualReady || activeMapPanel !== null} onselect={(id) => void loadTrail(id)} onhover={(id) => hoveredRouteChoiceId = id} />
 

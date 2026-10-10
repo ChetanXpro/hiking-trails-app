@@ -1,30 +1,44 @@
 <script lang="ts">
 	import { OUTDOOR_THEME } from '../../outdoor-theme';
 
-	interface SearchResult {
-		id: string;
-		name: string;
-		region?: string;
-		elevation?: number;
-		distance?: number;
-	}
-
 	interface Props {
 		query?: string;
-		results?: SearchResult[];
+		panelOpen?: boolean;
 		isLoading?: boolean;
-		onSearch?: (query: string) => void;
-		onSelectResult?: (result: SearchResult) => void;
-		placeholder?: string;
+		isError?: boolean;
+		errorMessage?: string;
+		searchResults?: any[];
+		searchRoutes?: any[];
+		searchPlaces?: any[];
+		activeSearchIndex?: number;
+		mapReady?: boolean;
+		minChars?: number;
+		detailPanelOpen?: boolean;
+		onInput?: (value: string) => void;
+		onFocus?: () => void;
+		onKeydown?: (event: KeyboardEvent) => void;
+		onSelectResult?: (result: any) => void;
+		onReset?: () => void;
 	}
 
 	let {
 		query = '',
-		results = [],
+		panelOpen = false,
 		isLoading = false,
-		onSearch,
+		isError = false,
+		errorMessage = '',
+		searchResults = [],
+		searchRoutes = [],
+		searchPlaces = [],
+		activeSearchIndex = 0,
+		mapReady = false,
+		minChars = 3,
+		detailPanelOpen = false,
+		onInput,
+		onFocus,
+		onKeydown,
 		onSelectResult,
-		placeholder = 'Search trails...'
+		onReset
 	}: Props = $props();
 
 	let searchInput: HTMLInputElement;
@@ -39,59 +53,101 @@
 	}
 </script>
 
-<div class="search-panel">
-	<div class="search-input-wrapper">
-		<input
-			bind:this={searchInput}
-			type="text"
-			class="search-input"
-			{placeholder}
-			value={query}
-			oninput={handleInput}
-			disabled={isLoading}
-		/>
-		{#if isLoading}
-			<span class="search-spinner"></span>
-		{:else if query}
-			<span class="search-icon">🔍</span>
+<div class:panel-open={detailPanelOpen} class="search-dock">
+	<div class:open={panelOpen} class="search-card">
+		<div class="search-input-wrap">
+			<span class="search-icon" aria-hidden="true">⌕</span>
+			<input
+				class="search-input"
+				aria-label="Search trails or places"
+				type="search"
+				placeholder={mapReady ? 'Search trails or places…' : 'Preparing map search…'}
+				disabled={!mapReady}
+				value={query}
+				oninput={(e) => onInput?.((e.target as HTMLInputElement).value)}
+				onfocus={onFocus}
+				onkeydown={onKeydown}
+			/>
+			{#if query}
+				<button class="search-clear" type="button" aria-label="Clear search" onclick={onReset}>
+					×
+				</button>
+			{/if}
+		</div>
+
+		{#if panelOpen}
+			<div class="search-results">
+				{#if query.trim().length < minChars}
+					<p class="search-hint">Type at least {minChars} characters to search trails and areas.</p>
+				{:else if isLoading}
+					<p class="search-hint">Searching the trail index…</p>
+				{:else if isError}
+					<p class="search-error">{errorMessage}</p>
+				{:else if searchResults.length === 0}
+					<p class="search-hint">No matches yet. Try a trail name or a place like Manali.</p>
+				{:else}
+					<div class="search-result-list">
+						{#if searchRoutes.length > 0}
+							<div class="search-group-label">Trails</div>
+							{#each searchRoutes as result}
+								<button
+									class:active={searchResults[activeSearchIndex]?.id === result.id}
+									class="search-result"
+									type="button"
+									onmouseenter={() => { /* handled by parent */ }}
+									onfocus={() => { /* handled by parent */ }}
+									onclick={() => onSelectResult?.(result)}
+								>
+									<div class="search-result-topline">
+										<span class="search-kind-pill">Trail</span>
+										{#if result.network}
+											<span class="search-network">{result.network}</span>
+										{/if}
+										{#if result.distance_m != null}
+											<span class="search-distance">{(result.distance_m / 1000).toFixed(1)} km</span>
+										{/if}
+									</div>
+									<strong>{result.name}</strong>
+									{#if result.subtitle}
+										<p>{result.subtitle}</p>
+									{/if}
+								</button>
+							{/each}
+						{/if}
+
+						{#if searchPlaces.length > 0}
+							<div class="search-group-label">Places</div>
+							{#each searchPlaces as result}
+								<button
+									class:active={searchResults[activeSearchIndex]?.id === result.id}
+									class="search-result"
+									type="button"
+									onmouseenter={() => { /* handled by parent */ }}
+									onfocus={() => { /* handled by parent */ }}
+									onclick={() => onSelectResult?.(result)}
+								>
+									<div class="search-result-topline">
+										<span class:region-pill={result.kind === 'region'} class="search-kind-pill">
+											{result.kind === 'region' ? 'Area' : 'Place'}
+										</span>
+										{#if result.admin_label}
+											<span class="search-network">{result.admin_label}</span>
+										{:else if result.place_kind}
+											<span class="search-network">{result.place_kind}</span>
+										{/if}
+									</div>
+									<strong>{result.name}</strong>
+									{#if result.breadcrumb.length > 0}
+										<p>{result.breadcrumb.join(', ')}</p>
+									{/if}
+								</button>
+							{/each}
+						{/if}
+					</div>
+				{/if}
+			</div>
 		{/if}
 	</div>
-
-	{#if results.length > 0}
-		<div class="search-results">
-			<div class="results-header">
-				<span class="results-count">{results.length} result{results.length === 1 ? '' : 's'}</span>
-			</div>
-			<ul class="results-list">
-				{#each results as result (result.id)}
-					<li class="result-item">
-						<button
-							class="result-button"
-							onclick={() => handleResultClick(result)}
-							type="button"
-						>
-							<div class="result-name">{result.name}</div>
-							<div class="result-details">
-								{#if result.region}
-									<span class="result-region">{result.region}</span>
-								{/if}
-								{#if result.elevation}
-									<span class="result-elevation">{result.elevation}m</span>
-								{/if}
-								{#if result.distance}
-									<span class="result-distance">{result.distance.toFixed(1)} km</span>
-								{/if}
-							</div>
-						</button>
-					</li>
-				{/each}
-			</ul>
-		</div>
-	{:else if query && !isLoading}
-		<div class="search-empty">
-			<p>No trails found matching "{query}"</p>
-		</div>
-	{/if}
 </div>
 
 <style>
