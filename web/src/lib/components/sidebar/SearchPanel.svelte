@@ -145,12 +145,7 @@
 	}
 
 	.search-dock.panel-open {
-		left: 0;
-		right: 0;
-		top: 0;
-		bottom: 0;
-		background: rgba(0, 0, 0, 0.3);
-		pointer-events: auto;
+		/* Don't block map - keep search card position */
 	}
 
 	.search-card {
