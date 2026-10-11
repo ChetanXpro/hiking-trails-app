@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # Bulk-download Copernicus GLO-30 DEM tiles (30m, public, no registration)
 # covering a lat/lon bounding box.
@@ -27,6 +27,29 @@ NORTH="$3"
 EAST="$4"
 OUTDIR="$5"
 
+for value_name in SOUTH WEST NORTH EAST; do
+	value=${!value_name}
+	if [[ ! "${value}" =~ ^-?[0-9]+$ ]]; then
+		lower_name=$(printf '%s' "${value_name}" | tr '[:upper:]' '[:lower:]')
+		echo "${lower_name} must be an integer degree, got: ${value}" >&2
+		exit 2
+	fi
+done
+if ((SOUTH >= NORTH || WEST >= EAST)); then
+	echo "Expected south < north and west < east" >&2
+	exit 2
+fi
+if ((SOUTH < -90 || NORTH > 90 || WEST < -180 || EAST > 180)); then
+	echo "Bounds must stay within latitude -90..90 and longitude -180..180" >&2
+	exit 2
+fi
+for command in curl gdalinfo; do
+	command -v "${command}" >/dev/null 2>&1 || {
+		echo "${command} is required" >&2
+		exit 1
+	}
+done
+
 mkdir -p "$OUTDIR"
 
 BASE_URL="https://copernicus-dem-30m.s3.amazonaws.com"
@@ -50,21 +73,42 @@ for (( lat=SOUTH; lat<NORTH; lat++ )); do
 		tile_name="Copernicus_DSM_COG_10_${lat_code}_${lon_code}_DEM"
 		url="${BASE_URL}/${tile_name}/${tile_name}.tif"
 		dest="${OUTDIR}/${tile_name}.tif"
+		partial="${dest}.part"
 
-		if [ -f "$dest" ]; then
-			echo "  already have ${tile_name}, skipping"
-			continue
+		if [[ -f "${dest}" ]]; then
+			if gdalinfo -json "${dest}" >/dev/null 2>&1; then
+				echo "  already have valid ${tile_name}, skipping"
+				continue
+			fi
+			echo "  existing ${tile_name} is not a readable raster; replacing it" >&2
+			rm -f "${dest}"
 		fi
 
-		status="$(curl -sS -L -o "$dest" -w '%{http_code}' "$url")"
-		if [ "$status" = "200" ]; then
-			size="$(du -h "$dest" | cut -f1)"
+		set +e
+		status=$(curl \
+			--silent --show-error --location --fail \
+			--retry 5 --retry-max-time 180 \
+			--connect-timeout 15 --continue-at - \
+			--output "${partial}" --write-out '%{http_code}' \
+			"${url}")
+		curl_status=$?
+		set -e
+
+		# A fully downloaded .part may produce HTTP 416 when curl tries to
+		# resume it. Validation is authoritative, so accept it if GDAL can
+		# open the raster.
+		if [[ -f "${partial}" ]] && gdalinfo -json "${partial}" >/dev/null 2>&1; then
+			mv -f "${partial}" "${dest}"
+			size="$(du -h "${dest}" | cut -f1)"
 			echo "  fetched ${tile_name} (${size})"
 			FETCHED=$((FETCHED + 1))
-		else
-			rm -f "$dest"
+		elif [[ "${status}" == "404" ]]; then
+			rm -f "${partial}"
 			echo "  no public tile for ${tile_name} (HTTP ${status}) -- skipping"
 			SKIPPED=$((SKIPPED + 1))
+		else
+			echo "  failed ${tile_name} (curl ${curl_status}, HTTP ${status:-unknown}); keeping ${partial} for resume" >&2
+			exit 1
 		fi
 	done
 done

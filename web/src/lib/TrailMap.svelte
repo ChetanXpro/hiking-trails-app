@@ -1,52 +1,202 @@
 	<script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
+	import { pushState, replaceState } from '$app/navigation';
+	import { env } from '$env/dynamic/public';
 	import maplibregl from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
+	import './trail-map.css';
+	import {
+		absolutizeBasemapStyleResources,
+		buildOsmDerivedVectorSource,
+		findFirstLabelAnchor,
+		normalizeBasemapStyleUrl,
+		prepareOutdoorBasemapStyle,
+		resolveTerrainOverlayAnchor,
+		shouldHideBasemapLayer,
+		terrainBasemapPaintOverrides,
+		type MutableBasemapStyle
+	} from './basemap-config';
+	import WeatherSummary from './WeatherSummary.svelte';
+	import TrailDiscovery from './TrailDiscovery.svelte';
+	import ElevationChart from './ElevationChart.svelte';
+	import { readMapState, writeMapState, viewportBounds } from './map-state';
+	import type { TrailDetail, TrailDiagnostic, TrailGeometry, PointGeometry, TrailWarning } from './types';
+	import { buildRouteIndex } from './profile-index';
+	let { qaMode = false }: { qaMode?: boolean } = $props();
+	import { installAppOutdoorPoiImages } from './outdoor-poi-icons';
+	import { OUTDOOR_THEME } from './outdoor-theme';
+	import {
+		buildCustomPoiFilter,
+		buildProviderPoiFilter,
+		CUSTOM_OUTDOOR_POI_TIERS,
+		isBasemapPoiLayer,
+		OUTDOOR_POI_LAYER_IDS,
+		poiLabelExpression,
+		PROVIDER_ALL_POIS_ZOOM,
+		PROVIDER_OUTDOOR_POI_TIERS,
+		PROVIDER_POI_ICON_EXPRESSION,
+		providerPoiLayerId,
+		type CustomOutdoorPoiTier,
+		type ProviderOutdoorPoiTier
+	} from './outdoor-poi-config';
+	import {
+		buildPeakTierFilter,
+		OUTDOOR_PEAK_LAYER_IDS,
+		PEAK_LABEL_TIERS
+	} from './peak-config';
+	import {
+		DEFAULT_TERRAIN_ATTRIBUTION,
+		contourIntervalsAtZoom,
+		DEFAULT_TERRAIN_BOUNDS,
+		DEFAULT_TERRAIN_RGB_URL,
+		normalizeTerrainBounds,
+		normalizeTerrainMaxZoom
+	} from './terrain-config';
+	import { SLOPE_BANDS, SLOPE_CLEAR_BELOW, SLOPE_PLANNING_NOTE } from './slope-config';
+	import {
+		DEFAULT_WEATHER_API_URL,
+		fetchWeatherForecast,
+		type LngLatTuple,
+		type WeatherForecast
+	} from './weather';
+	import { isAbortError, requestBlob, requestJson } from './request';
+	import {
+		dedupeMapSelections,
+		markedLocationSelection,
+		openStreetMapUrl,
+		selectionFromRenderedFeature,
+		type MapFeatureSelection
+	} from './map-selection';
 	import {
 		addTerrainLayers,
+		sampleTerrainElevation,
 		set3DTerrainEnabled,
+		setColorReliefVisible,
 		setContourUnit,
 		setContoursVisible,
 		setHillshadeVisible,
-		setTerrainExaggeration
+		setSlopeOpacity,
+		setSlopeVisible
 	} from './terrain-layers';
+	import { TerrainControls, LayersPanel } from './components/controls';
+	import { TrailDetailPanel, FeaturePanel, SearchPanel, RouteChooser } from './components/sidebar';
+	import { MapControls, Map3DView, MapLoadingCard } from './components/map';
 
 	const INITIAL_CENTER: [number, number] = [77.18, 32.24];
 	const INITIAL_ZOOM = 9;
+	function publicSetting(name: `PUBLIC_${string}`, legacyValue?: string) {
+		return env[name]?.trim() || legacyValue?.trim() || undefined;
+	}
+
+	const CONFIGURED_BASEMAP_STYLE_URL = publicSetting(
+		'PUBLIC_BASEMAP_STYLE_URL',
+		import.meta.env.VITE_BASEMAP_STYLE_URL
+	);
+	const BASEMAP_STYLE_URL = CONFIGURED_BASEMAP_STYLE_URL
+		? normalizeBasemapStyleUrl(CONFIGURED_BASEMAP_STYLE_URL)
+		: import.meta.env.DEV
+			? normalizeBasemapStyleUrl(undefined)
+			: null;
+	const BASEMAP_LABEL_ANCHOR_ID = publicSetting(
+		'PUBLIC_BASEMAP_LABEL_ANCHOR_ID',
+		import.meta.env.VITE_BASEMAP_LABEL_ANCHOR_ID
+	);
+	const CUSTOM_GLYPHS_URL = publicSetting(
+		'PUBLIC_MAP_GLYPHS_URL',
+		import.meta.env.VITE_MAP_GLYPHS_URL
+	);
 	const GLYPHS_URL =
-		import.meta.env.VITE_MAP_GLYPHS_URL ??
-		'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf';
+		CUSTOM_GLYPHS_URL ??
+		(import.meta.env.DEV
+			? 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf'
+			: undefined);
+	const RASTER_TILE_URL_TEMPLATE =
+		publicSetting('PUBLIC_RASTER_TILE_URL', import.meta.env.VITE_RASTER_TILE_URL) ??
+		(import.meta.env.DEV ? 'https://tile.openstreetmap.org/{z}/{x}/{y}.png' : undefined);
+	const RASTER_TILE_ATTRIBUTION =
+		publicSetting(
+			'PUBLIC_RASTER_TILE_ATTRIBUTION',
+			import.meta.env.VITE_RASTER_TILE_ATTRIBUTION
+		) ?? (import.meta.env.DEV ? '&copy; OpenStreetMap contributors' : undefined);
+	const WEATHER_API_URL =
+		publicSetting('PUBLIC_WEATHER_API_URL', import.meta.env.VITE_WEATHER_API_URL) ??
+		(import.meta.env.DEV ? DEFAULT_WEATHER_API_URL : undefined);
 	const MARTIN_TRAILS_URL_TEMPLATE =
-		import.meta.env.VITE_MARTIN_TRAILS_URL ?? '/trail_lines/{z}/{x}/{y}';
+		publicSetting('PUBLIC_MARTIN_TRAILS_URL', import.meta.env.VITE_MARTIN_TRAILS_URL) ??
+		'/trail_lines/{z}/{x}/{y}';
+	const MARTIN_OUTDOOR_WAYPOINTS_URL_TEMPLATE =
+		publicSetting(
+			'PUBLIC_MARTIN_OUTDOOR_WAYPOINTS_URL',
+			import.meta.env.VITE_MARTIN_OUTDOOR_WAYPOINTS_URL
+		) ?? '/outdoor_waypoints/{z}/{x}/{y}';
 	const TERRAIN_RGB_URL_TEMPLATE =
-		import.meta.env.VITE_TERRAIN_RGB_URL ?? '/terrain_rgb/{z}/{x}/{y}';
+		publicSetting('PUBLIC_TERRAIN_RGB_URL', import.meta.env.VITE_TERRAIN_RGB_URL) ??
+		DEFAULT_TERRAIN_RGB_URL;
+	const TERRAIN_RGB_ENCODING =
+		publicSetting('PUBLIC_TERRAIN_RGB_ENCODING', import.meta.env.VITE_TERRAIN_RGB_ENCODING)?.toLowerCase() === 'terrarium'
+			? 'terrarium'
+			: 'mapbox';
+	const TERRAIN_RGB_TILE_SIZE =
+		Number.parseInt(
+			publicSetting('PUBLIC_TERRAIN_RGB_TILE_SIZE', import.meta.env.VITE_TERRAIN_RGB_TILE_SIZE) ??
+				'512',
+			10
+		) === 256
+			? 256
+			: 512;
+	const TERRAIN_RGB_MAX_ZOOM = normalizeTerrainMaxZoom(
+		publicSetting('PUBLIC_TERRAIN_RGB_MAX_ZOOM', import.meta.env.VITE_TERRAIN_RGB_MAX_ZOOM) ??
+			'13'
+	);
+	const TERRAIN_RGB_BOUNDS = normalizeTerrainBounds(
+		publicSetting('PUBLIC_TERRAIN_RGB_BOUNDS', import.meta.env.VITE_TERRAIN_RGB_BOUNDS),
+		TERRAIN_RGB_URL_TEMPLATE === DEFAULT_TERRAIN_RGB_URL ? DEFAULT_TERRAIN_BOUNDS : undefined
+	);
+	const TERRAIN_ATTRIBUTION =
+		publicSetting('PUBLIC_TERRAIN_ATTRIBUTION', import.meta.env.VITE_TERRAIN_ATTRIBUTION) ||
+		(TERRAIN_RGB_URL_TEMPLATE === DEFAULT_TERRAIN_RGB_URL
+			? DEFAULT_TERRAIN_ATTRIBUTION
+			: undefined);
 	const HOVERED_ROUTE_CASING_LAYER = 'hovered-route-casing';
 	const HOVERED_ROUTE_LAYER = 'hovered-route-line';
+	const TRAIL_LOCAL_CASING_LAYER = 'trail-local-casing';
+	const TRAIL_REGIONAL_CASING_LAYER = 'trail-regional-casing';
+	const TRAIL_MAJOR_CASING_LAYER = 'trail-major-casing';
+	const TRAIL_LOCAL_LAYER = 'trail-local-lines';
+	const TRAIL_REGIONAL_LAYER = 'trail-regional-lines';
+	const TRAIL_MAJOR_LAYER = 'trail-major-lines';
+	const TRAIL_FALLBACK_CASING_LAYER = 'trail-fallback-casing';
+	const TRAIL_FALLBACK_LAYER = 'trail-fallback-lines';
+	const TRAIL_NETWORK_LAYER_IDS = [
+		TRAIL_FALLBACK_LAYER,
+		TRAIL_LOCAL_LAYER,
+		TRAIL_REGIONAL_LAYER,
+		TRAIL_MAJOR_LAYER
+	] as const;
+	const TRAIL_LABEL_LAYER_IDS = [
+		'trail-major-labels',
+		'trail-regional-labels',
+		'trail-local-labels',
+		'trail-fallback-labels'
+	] as const;
+	const OUTDOOR_ROCK_LAYER_ID = 'outdoor-rock';
+	const OUTDOOR_PEAK_LAYER_ID = OUTDOOR_PEAK_LAYER_IDS[0];
+	const OUTDOOR_PEAK_LAYER_ID_SET = new Set(OUTDOOR_PEAK_LAYER_IDS);
 	const SELECTED_TRAIL_SOURCE = 'selected-trail';
 	const SELECTED_TRAIL_GLOW_LAYER = 'selected-trail-glow';
 	const SELECTED_TRAIL_CASING_LAYER = 'selected-trail-casing';
 	const SELECTED_TRAIL_LAYER = 'selected-trail-line';
 	const SELECTED_TRAIL_ARROW_LAYER = 'selected-trail-direction';
 	const SELECTED_TRAIL_ARROW_IMAGE = 'selected-trail-direction-chevron';
-	const SELECTED_TRAIL_BOTH_LAYER = 'selected-trail-both-direction';
-	const SELECTED_TRAIL_BOTH_IMAGE = 'selected-trail-direction-dot';
 	const SELECTED_TRAIL_MARKER_LAYER = 'selected-trail-markers';
-
-	type TrailGeometry = {
-		type: string;
-		coordinates?: unknown;
-		geometries?: unknown[];
-	};
-
-	type PointGeometry = {
-		type: 'Point';
-		coordinates: [number, number];
-	};
-
-	type TrailDiagnostic = {
-		kind: string;
-		geometry: PointGeometry;
-	};
+	const SELECTED_TRAIL_MARKER_LABEL_LAYER = 'selected-trail-marker-labels';
+	const SELECTED_TRAIL_CURSOR_SOURCE = 'selected-trail-profile-cursor';
+	const SELECTED_TRAIL_CURSOR_LAYER = 'selected-trail-profile-cursor-point';
+	const SELECTED_MAP_FEATURE_SOURCE = 'selected-map-feature';
+	const SELECTED_MAP_FEATURE_GLOW_LAYER = 'selected-map-feature-glow';
+	const SELECTED_MAP_FEATURE_LAYER = 'selected-map-feature-point';
+	const PROFILE_CURSOR_KIND = 'profile_cursor';
+	const KNOWN_NETWORKS = ['iwn', 'nwn', 'rwn', 'lwn'] as const;
 
 	type GeoJsonFeature = {
 		type: 'Feature';
@@ -66,13 +216,9 @@
 		count: number;
 	};
 
-	type TrailWarning = {
-		kind: string;
-		message: string;
-	};
-
 	type DirectionMode = 'forward' | 'backward' | 'both';
 	type DownloadFormat = 'gpx' | 'kml' | 'geojson';
+	type MapPanel = 'layers' | 'terrain' | null;
 
 	type RouteChoice = {
 		id: string;
@@ -92,76 +238,194 @@
 		profile_points: ElevationPoint[];
 	};
 
-	type TrailDetail = {
+	type SearchRouteResult = {
+		kind: 'trail';
 		id: string;
-		name: string | null;
+		name: string;
+		subtitle: string | null;
 		network: string | null;
-		difficulty: string | null;
 		distance_m: number | null;
-		ascent_m: number | null;
-		descent_m: number | null;
-		summary: string | null;
-		hike_type: string | null;
-		estimated_duration_min: number | null;
-		default_direction_mode?: DirectionMode | null;
-		direction_source?: string | null;
-		source_kind: string;
-		network_type?: string | null;
-		route_tag?: string | null;
-		route_from?: string | null;
-		route_to?: string | null;
-		route_via?: string | null;
-		website_url?: string | null;
-		video_url?: string | null;
-		geometry: TrailGeometry | null;
-		start_point: PointGeometry | null;
-		end_point: PointGeometry | null;
-		region_breadcrumb: string[];
-		surfaces: Array<{
-			surface_type: string;
-			distance_m: number;
-			pct: number;
-		}>;
-		features: string[];
-		waypoints: Array<{
-			kind: string;
-			name: string | null;
-			elevation_m: number | null;
-		}>;
-		stitch_diagnostics: TrailDiagnostic[];
-		stitch_warnings: TrailWarning[];
+		breadcrumb: string[];
+	};
+
+	type SearchPlaceResult = {
+		kind: 'region' | 'place';
+		id: string;
+		name: string;
+		place_kind: string | null;
+		admin_label: string | null;
+		breadcrumb: string[];
+		bbox: [number, number, number, number] | null;
+		center: [number, number] | null;
+	};
+
+	type SearchResult = SearchRouteResult | SearchPlaceResult;
+
+	type SearchPayload = {
+		routes: SearchRouteResult[];
+		places: SearchPlaceResult[];
+	};
+
+	type RuntimeStyleLayer = {
+		id: string;
+		type?: string;
+		source?: string;
+		'source-layer'?: string;
 	};
 
 	let mapContainer: HTMLDivElement;
+	let searchInput: HTMLInputElement | undefined;
 	let map: maplibregl.Map | undefined;
+	let scaleControl: maplibregl.ScaleControl | undefined;
+	let waypointMarker: maplibregl.Marker | undefined;
 	let selectedTrail: TrailDetail | null = $state(null);
+	let selectedMapFeature: MapFeatureSelection | null = $state(null);
+	let nearbyMapFeatures: MapFeatureSelection[] = $state([]);
+	let nearbyTrailChoices: RouteChoice[] = $state([]);
+	let selectedFeatureElevationStatus: 'idle' | 'loading' | 'ready' | 'missing' = $state('idle');
+	let coordinateCopyStatus: 'idle' | 'copied' | 'error' = $state('idle');
+	let mapFeatureRequestVersion = 0;
+	let mapFeatureElevationAbortController: AbortController | null = null;
 	let detailError: string | null = $state(null);
 	let directionMode: DirectionMode = $state('forward');
 	let downloadFormat: DownloadFormat = $state('gpx');
 	let downloadSectionOpen = $state(false);
 	let downloadBusy = $state(false);
 	let downloadError: string | null = $state(null);
+	let downloadAbortController: AbortController | null = null;
+	let downloadRequestVersion = 0;
 	let trailRequestVersion = 0;
+	let trailDetailAbortController: AbortController | null = null;
+	let elevationAbortController: AbortController | null = null;
 	let routeChoices: RouteChoice[] = $state([]);
 	let routeChooserPosition: { x: number; y: number } | null = $state(null);
 	let hoveredRouteChoiceId: string | null = $state(null);
 	let elevationProfile: ElevationProfile | null = $state(null);
 	let elevationStatus: 'idle' | 'loading' | 'ready' | 'missing' | 'error' = $state('idle');
 	let elevationError: string | null = $state(null);
+	let elevationHoverPosM: number | null = $state(null);
+	let elevationHoverEleM: number | null = $state(null);
 	let terrainPanelOpen = $state(false);
 	let terrainReady = $state(false);
+	let mapVisualReady = $state(false);
+	let mapLoadError: string | null = $state(null);
 	let terrain3dEnabled = $state(false);
 	let terrainHillshadeVisible = $state(true);
-	let terrainContoursVisible = $state(false);
+	let terrainContoursVisible = $state(true);
+	let terrainColorReliefVisible = $state(false);
+	let terrainSlopeVisible = $state(false);
+	let terrainSlopeOpacity = $state(0.7);
 	let terrainContourUnit: 'meters' | 'feet' = $state('meters');
-	let terrainExaggeration = $state(1.2);
+	const TERRAIN_EXAGGERATION = 1.15;
 	let terrainColorReliefSupported = $state(false);
+	let terrainSlopeSupported = $state(false);
+	let mapPitch = $state(0);
+	let mapBearing = $state(0);
+	let activeMapPanel: MapPanel = $state(null);
+	let knownRoutesVisible = $state(true);
+	let routeLabelsVisible = $state(true);
+	let ordinaryPathsVisible = $state(true);
+	let outdoorPoisVisible = $state(true);
+	let peakLabelsVisible = $state(true);
+	let regionBoundariesVisible = $state(true);
+	let weatherForecast: WeatherForecast | null = $state(null);
+	let weatherStatus: 'idle' | 'loading' | 'ready' | 'error' = $state('idle');
+	let weatherError: string | null = $state(null);
+	let weatherAbortController: AbortController | null = null;
+	const weatherCache = new Map<string, { forecast: WeatherForecast; expiresAt: number }>();
+	let searchQuery = $state('');
+	let searchRoutes: SearchRouteResult[] = $state([]);
+	let searchPlaces: SearchPlaceResult[] = $state([]);
+	let searchResults: SearchResult[] = $state([]);
+	let searchPanelOpen = $state(false);
+	let searchLoading = $state(false);
+	let searchError: string | null = $state(null);
+	let activeSearchIndex = $state(-1);
+	let searchRequestVersion = 0;
+	let searchAbortController: AbortController | null = null;
+	let searchDebounceHandle: ReturnType<typeof setTimeout> | null = null;
+	let mapLabelAnchorId: string | undefined;
+	let mapTerrainAnchorId: string | undefined;
+	let mapRevealHandle: ReturnType<typeof setTimeout> | null = null;
+	let componentDestroyed = false;
+	const reportedMapErrors = new Set<string>();
+	let detailPanelOpen = $derived(Boolean(selectedTrail || selectedMapFeature || detailError));
+
+	let discoveryBounds: [number, number, number, number] | null = $state(null);
+	let mapZoom = $state(INITIAL_ZOOM);
+	let shareMessage = $state('');
+	let shareFallback = $state('');
+	let restoringLocation = false;
+	let restorationVersion = 0;
+	let navigationTrailId: string | null = null;
+	const routeIndex = $derived.by(() => selectedTrail?.geometry ? buildRouteIndex(selectedTrail.geometry, coordinateDistanceM) : null);
+	const incompleteRoute = $derived.by(() => selectedTrail?.stitch_warnings.some(w => ['disconnected_pieces', 'stranded_segments', 'missing_members'].includes(w.kind)) ?? false);
+	const contourInterval = $derived(contourIntervalsAtZoom(terrainContourUnit, mapZoom));
+
+	function showWaypoint(waypoint: TrailDetail['waypoints'][number]) {
+		if (!map || waypoint.longitude == null || waypoint.latitude == null) return;
+		const center: [number, number] = [waypoint.longitude, waypoint.latitude];
+		waypointMarker?.remove();
+		waypointMarker = new maplibregl.Marker({ color: '#d3a642' }).setLngLat(center).addTo(map);
+		map.fitBounds([center, center], { maxZoom: Math.max(14, map.getZoom()), duration: 500,
+			padding: window.innerWidth < 740 ? { top: 50, bottom: window.innerHeight * .6, left: 20, right: 20 } : { top: 70, bottom: 40, left: 500, right: 80 } });
+	}
+
+	function currentView() {
+		return map ? { center: [map.getCenter().lng, map.getCenter().lat] as [number, number], zoom: map.getZoom() } : null;
+	}
+	function persistLocation(push = false) {
+		if (restoringLocation || !map) return;
+		const url = writeMapState(new URL(window.location.href), navigationTrailId, currentView());
+		if (url.href !== window.location.href) (push ? pushState : replaceState)(url, {});
+	}
+	function updateViewport() {
+		if (!map) return;
+		const b = map.getBounds();
+		discoveryBounds = viewportBounds(b.getWest(), b.getSouth(), b.getEast(), b.getNorth()).map(v => Number(v.toFixed(5))) as [number, number, number, number];
+		mapZoom = map.getZoom();
+		persistLocation();
+	}
+	async function restoreLocation() {
+		const version = ++restorationVersion;
+		const state = readMapState(new URL(window.location.href));
+		restoringLocation = true;
+		try {
+			navigationTrailId = state.trail;
+			if (state.view) map?.jumpTo({ ...state.view, padding: { top: 0, bottom: 0, left: 0, right: 0 } });
+			if (state.trail) await loadTrail(state.trail, false, !state.view);
+			else closePanel();
+		} finally { if (version === restorationVersion) restoringLocation = false; }
+	}
+	async function shareTrail() {
+		if (!selectedTrail) return;
+		const url = writeMapState(new URL(window.location.href), selectedTrail.id, currentView()).href;
+		shareMessage = 'Share this hike'; shareFallback = url;
+		try {
+			if (navigator.share) { await navigator.share({ title: selectedTrail.name ?? 'Hiking route', url }); shareMessage = 'Shared'; }
+			else { await navigator.clipboard.writeText(url); shareMessage = 'Link copied'; shareFallback = ''; }
+		} catch (error) {
+			if (error instanceof Error && error.name === 'AbortError') return;
+			shareFallback = url; shareMessage = 'Copy this link to share the hike.';
+		}
+	}
+
+	// PostgreSQL's trigram index needs three characters to avoid turning every
+	// short public search into a full scan as the place catalogue grows.
+	const SEARCH_MIN_CHARS = 3;
 
 	$effect(() => {
 		if (!selectedTrail) return;
 		directionMode;
 		downloadSectionOpen;
 		syncSelectedTrailLayer();
+	});
+
+	$effect(() => {
+		selectedTrail;
+		elevationHoverPosM;
+		elevationHoverEleM;
+		syncProfileCursorLayer();
 	});
 
 	$effect(() => {
@@ -175,151 +439,1209 @@
 		terrain3dEnabled;
 		terrainHillshadeVisible;
 		terrainContoursVisible;
+		terrainColorReliefVisible;
+		terrainSlopeVisible;
+		terrainSlopeOpacity;
 		terrainContourUnit;
-		terrainExaggeration;
 
 		if (!map || !terrainReady) return;
 
 		setHillshadeVisible(map, terrainHillshadeVisible);
 		setContoursVisible(map, terrainContoursVisible);
+		setColorReliefVisible(map, terrainColorReliefVisible);
+		setSlopeVisible(map, terrainSlopeVisible);
+		setSlopeOpacity(map, terrainSlopeOpacity);
 		setContourUnit(map, terrainContourUnit);
-		setTerrainExaggeration(map, terrainExaggeration);
-		set3DTerrainEnabled(map, terrain3dEnabled, terrainExaggeration);
+		setOutdoorElevationUnit(terrainContourUnit);
+		scaleControl?.setUnit(terrainContourUnit === 'feet' ? 'imperial' : 'metric');
+		set3DTerrainEnabled(map, terrain3dEnabled, TERRAIN_EXAGGERATION);
+	});
+
+	$effect(() => {
+		map;
+		terrainReady;
+		knownRoutesVisible;
+		routeLabelsVisible;
+		ordinaryPathsVisible;
+		outdoorPoisVisible;
+		peakLabelsVisible;
+		regionBoundariesVisible;
+		if (!map || !terrainReady) return;
+		applyWorkspaceLayerVisibility();
 	});
 
 	onMount(() => {
+		window.addEventListener('popstate', restoreLocation);
+		void initializeMap().catch((error) => {
+			mapLoadError = error instanceof Error ? error.message : 'The outdoor map could not be prepared.';
+		});
+	});
+
+	async function loadPreparedMapStyle(): Promise<string | maplibregl.StyleSpecification> {
+		if (!BASEMAP_STYLE_URL) return buildLegacyRasterStyle();
+
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), 4500);
+		try {
+			const response = await fetch(BASEMAP_STYLE_URL, { signal: controller.signal });
+			if (!response.ok) throw new Error(`Basemap style request failed with ${response.status}`);
+			const style = (await response.json()) as maplibregl.StyleSpecification;
+			const mutableStyle = style as unknown as MutableBasemapStyle;
+			absolutizeBasemapStyleResources(
+				mutableStyle,
+				BASEMAP_STYLE_URL,
+				typeof window === 'undefined' ? 'http://localhost/' : window.location.href
+			);
+			if (CUSTOM_GLYPHS_URL) mutableStyle.glyphs = CUSTOM_GLYPHS_URL;
+			return prepareOutdoorBasemapStyle(mutableStyle) as unknown as maplibregl.StyleSpecification;
+		} catch {
+			// The loading veil still prevents a provider-style flash while MapLibre
+			// falls back to loading the remote style directly.
+			return BASEMAP_STYLE_URL;
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
+
+	async function initializeMap() {
 		const martinTrailsUrl = absolutizeTileTemplate(MARTIN_TRAILS_URL_TEMPLATE);
+		const martinOutdoorWaypointsUrl = absolutizeTileTemplate(
+			MARTIN_OUTDOOR_WAYPOINTS_URL_TEMPLATE
+		);
 		const terrainRgbUrl = absolutizeTileTemplate(TERRAIN_RGB_URL_TEMPLATE);
+		const initialState = readMapState(new URL(window.location.href));
+		navigationTrailId = initialState.trail;
+		const preparedStyle = await loadPreparedMapStyle();
+		if (componentDestroyed) return;
 
 		map = new maplibregl.Map({
 			container: mapContainer,
-			style: {
-				version: 8,
-				glyphs: GLYPHS_URL,
-				sources: {
-					osm: {
-						type: 'raster',
-						tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-						tileSize: 256,
-						attribution: '&copy; OpenStreetMap contributors'
-					},
-					trails: {
-						type: 'vector',
-						tiles: [martinTrailsUrl],
-						minzoom: 0,
-						maxzoom: 14
-					}
-				},
-				layers: [
-					{ id: 'osm', type: 'raster', source: 'osm' },
-					{
-						id: 'trail-lines',
-						type: 'line',
-						source: 'trails',
-						'source-layer': 'trail_lines',
-						layout: {
-							'line-cap': 'round',
-							'line-join': 'round'
-						},
-						paint: {
-							'line-color': [
-								'match',
-								['get', 'difficulty'],
-								'hiking', '#5f9f4f',
-								'mountain_hiking', '#c9a227',
-								'demanding_mountain_hiking', '#d27b2c',
-								'alpine_hiking', '#c45843',
-								'demanding_alpine_hiking', '#8b5aa8',
-								'difficult_alpine_hiking', '#57457d',
-								'#4d82b8'
-							],
-							'line-width': 2.6,
-							'line-opacity': 0.72
-						}
-					},
-					{
-						id: HOVERED_ROUTE_CASING_LAYER,
-						type: 'line',
-						source: 'trails',
-						'source-layer': 'trail_lines',
-						filter: ['==', ['get', 'id'], ''],
-						layout: {
-							'line-cap': 'round',
-							'line-join': 'round'
-						},
-						paint: {
-							'line-color': 'rgba(65, 74, 20, 0.55)',
-							'line-width': 10,
-							'line-opacity': 0.88,
-							'line-blur': 0.6
-						}
-					},
-					{
-						id: HOVERED_ROUTE_LAYER,
-						type: 'line',
-						source: 'trails',
-						'source-layer': 'trail_lines',
-						filter: ['==', ['get', 'id'], ''],
-						layout: {
-							'line-cap': 'round',
-							'line-join': 'round'
-						},
-						paint: {
-							'line-color': '#dfff2a',
-							'line-width': 6.4,
-							'line-opacity': 0.98
-						}
-					}
-				]
-			},
-			center: INITIAL_CENTER,
-			zoom: INITIAL_ZOOM
+			style: preparedStyle,
+			center: initialState.view?.center ?? INITIAL_CENTER,
+			zoom: initialState.view?.zoom ?? INITIAL_ZOOM,
+			maxPitch: 60,
+			centerClampedToGround: true,
+			attributionControl: false,
+			fadeDuration: 100
 		});
+		map.on('error', (event) => handleMapError(event.error));
 
+		map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
+		map.addControl(new maplibregl.FullscreenControl(), 'top-right');
 		map.addControl(new maplibregl.NavigationControl(), 'top-right');
+		map.addControl(
+			new maplibregl.GeolocateControl({
+				positionOptions: { enableHighAccuracy: true },
+				trackUserLocation: true,
+				showAccuracyCircle: true
+			}),
+			'top-right'
+		);
+		scaleControl = new maplibregl.ScaleControl({ maxWidth: 140, unit: 'metric' });
+		map.addControl(scaleControl, 'bottom-left');
+		scheduleMapRevealFallback(10000);
 		map.on('load', () => {
 			if (!map) return;
+			tuneBasemapForTerrain();
+			mapLabelAnchorId = resolveLabelAnchorId();
+			mapTerrainAnchorId = resolveTerrainAnchorId();
+			addOutdoorContextLayers(
+				martinOutdoorWaypointsUrl,
+				mapTerrainAnchorId,
+				mapLabelAnchorId
+			);
+			addTrailNetworkLayers(
+				martinTrailsUrl,
+				resolveOutdoorPoiAnchorId()
+			);
 			const capabilities = addTerrainLayers(map, {
 				terrainRgbUrl,
-				beforeLayerId: 'trail-lines',
+				encoding: TERRAIN_RGB_ENCODING,
+				tileSize: TERRAIN_RGB_TILE_SIZE,
+				maxzoom: TERRAIN_RGB_MAX_ZOOM,
+				bounds: TERRAIN_RGB_BOUNDS,
+				attribution: TERRAIN_ATTRIBUTION,
+				surfaceAnchorId: mapTerrainAnchorId,
+				labelAnchorId: map.getLayer(OUTDOOR_PEAK_LAYER_ID)
+					? OUTDOOR_PEAK_LAYER_ID
+					: TRAIL_LOCAL_CASING_LAYER,
 				terrainEnabled: terrain3dEnabled,
 				hillshadeVisible: terrainHillshadeVisible,
 				contoursVisible: terrainContoursVisible,
+				colorReliefVisible: terrainColorReliefVisible,
+				slopeVisible: terrainSlopeVisible,
+				slopeOpacity: terrainSlopeOpacity,
 				contourUnit: terrainContourUnit,
-				exaggeration: terrainExaggeration
+				exaggeration: TERRAIN_EXAGGERATION
 			});
 			terrainColorReliefSupported = capabilities.colorRelief;
+			terrainSlopeSupported = capabilities.slope;
 			terrainReady = true;
+			applyWorkspaceLayerVisibility();
+			if (selectedTrail) {
+				syncSelectedTrailLayer();
+				fitToSelectedTrail();
+			}
+			if (selectedMapFeature) syncSelectedMapFeatureLayer();
+
+			for (const layerId of TRAIL_NETWORK_LAYER_IDS) {
+				map.on('mouseenter', layerId, () => {
+					map?.getCanvas().style.setProperty('cursor', 'pointer');
+				});
+				map.on('mouseleave', layerId, () => {
+					map?.getCanvas().style.setProperty('cursor', '');
+				});
+			}
+			for (const layerId of interactiveMapFeatureLayerIds()) {
+				map.on('mouseenter', layerId, () => {
+					map?.getCanvas().style.setProperty('cursor', 'pointer');
+				});
+				map.on('mouseleave', layerId, () => {
+					map?.getCanvas().style.setProperty('cursor', '');
+				});
+			}
+
+			void restoreLocation();
+			updateViewport();
+			revealMapAfterInitialRender();
 		});
 
-		map.on('click', 'trail-lines', async (event) => {
-			const choices = routeChoicesAtPoint(event.point);
-			if (choices.length === 0) return;
+		map.on('pitch', () => {
+			if (map) mapPitch = Math.round(map.getPitch());
+		});
+		map.on('rotate', () => {
+			if (map) mapBearing = Math.round(map.getBearing());
+		});
 
-			if (choices.length === 1) {
-				clearRouteChoices();
-				await loadTrail(choices[0].id);
+		map.on('moveend', updateViewport);
+		map.on('click', (event) => void handleMapClick(event));
+	}
+
+	function handleMapError(error: unknown) {
+		if (componentDestroyed || isAbortError(error)) return;
+		const message =
+			error instanceof Error
+				? error.message
+				: typeof error === 'string'
+					? error
+					: 'Unknown map rendering error';
+		if (!reportedMapErrors.has(message) && reportedMapErrors.size < 5) {
+			reportedMapErrors.add(message);
+			console.warn('MapLibre:', message);
+		}
+
+		// Individual missing tiles are recoverable and should not cover a usable
+		// map. Surface only initialization/rendering failures before first paint.
+		if (
+			!mapVisualReady &&
+			/(style|webgl|failed to initialize|source .* not found|parse)/i.test(message)
+		) {
+			mapLoadError = 'The map could not finish loading its style or renderer. Check the configured map services and try again.';
+		}
+	}
+
+	async function handleMapClick(event: maplibregl.MapMouseEvent) {
+		closeSearchPanel();
+		const pointFeatures = mapFeatureSelectionsAtPoint(event.point, [
+			event.lngLat.lng,
+			event.lngLat.lat
+		]);
+		const choices = routeChoicesAtPoint(event.point);
+		if (pointFeatures.length > 0) {
+			clearRouteChoices();
+			await selectMapFeature(pointFeatures[0], pointFeatures.slice(1), choices);
+			return;
+		}
+
+		if (choices.length === 0) {
+			clearRouteChoices();
+			await selectMapFeature(
+				markedLocationSelection([event.lngLat.lng, event.lngLat.lat]),
+				[],
+				[]
+			);
+			return;
+		}
+
+		if (choices.length === 1) {
+			clearRouteChoices();
+			await loadTrail(choices[0].id);
+			return;
+		}
+
+		routeChoices = choices;
+		routeChooserPosition = routeChooserPositionFor(event.point, choices.length);
+	}
+
+	function interactivePointLayerIds() {
+		if (!map) return [];
+		return [...OUTDOOR_POI_LAYER_IDS, ...OUTDOOR_PEAK_LAYER_IDS].filter((layerId) =>
+			Boolean(map?.getLayer(layerId))
+		);
+	}
+
+	function interactiveNamedFeatureLayerIds() {
+		return styleLayers()
+			.filter((layer) => {
+				if (layer.source !== 'openmaptiles') return false;
+				const sourceLayer = layer['source-layer']?.toLowerCase() ?? '';
+				if (layer.type === 'line' && sourceLayer === 'waterway') return true;
+				return (
+					layer.type === 'symbol' &&
+					/^(place|water_name|waterway|transportation_name|park)$/.test(sourceLayer)
+				);
+			})
+			.map((layer) => layer.id);
+	}
+
+	function interactiveMapFeatureLayerIds() {
+		return [...new Set([...interactivePointLayerIds(), ...interactiveNamedFeatureLayerIds()])];
+	}
+
+	function mapFeatureSelectionsAtPoint(
+		point: maplibregl.Point,
+		clickedCoordinates: [number, number]
+	) {
+		if (!map) return [];
+		const pointLayers = new Set(interactivePointLayerIds());
+		const layers = interactiveMapFeatureLayerIds();
+		if (layers.length === 0) return [];
+		const rendered = map.queryRenderedFeatures(
+			[
+				[point.x - 9, point.y - 9],
+				[point.x + 9, point.y + 9]
+			],
+			{ layers }
+		);
+		const ordered = [...rendered].sort((left, right) => {
+			const leftPriority =
+				left.source === 'outdoor-waypoints' ? 0 : pointLayers.has(left.layer.id) ? 1 : 2;
+			const rightPriority =
+				right.source === 'outdoor-waypoints' ? 0 : pointLayers.has(right.layer.id) ? 1 : 2;
+			return leftPriority - rightPriority;
+		});
+		const selections = ordered.flatMap((feature) => {
+			let coordinates = clickedCoordinates;
+			if (pointLayers.has(feature.layer.id) && feature.geometry?.type === 'Point') {
+				const pointCoordinates = feature.geometry.coordinates;
+				if (
+					Array.isArray(pointCoordinates) &&
+					pointCoordinates.length >= 2 &&
+					typeof pointCoordinates[0] === 'number' &&
+					typeof pointCoordinates[1] === 'number'
+				) {
+					coordinates = [pointCoordinates[0], pointCoordinates[1]];
+				}
+			}
+			const selection = selectionFromRenderedFeature({
+				layerId: feature.layer.id,
+				source: feature.source,
+				sourceLayer: (feature.layer as RuntimeStyleLayer)['source-layer'],
+				properties: feature.properties,
+				coordinates
+			});
+			return selection ? [selection] : [];
+		});
+		return dedupeMapSelections(selections);
+	}
+
+	async function selectMapFeature(
+		feature: MapFeatureSelection,
+		nearby: MapFeatureSelection[],
+		nearbyTrails: RouteChoice[]
+	) {
+		abortTrailRequests();
+		mapFeatureElevationAbortController?.abort();
+		const controller = new AbortController();
+		mapFeatureElevationAbortController = controller;
+		const requestVersion = ++mapFeatureRequestVersion;
+		selectedTrail = null;
+		navigationTrailId = null;
+		persistLocation(true);
+		waypointMarker?.remove();
+		detailError = null;
+		clearSelectedTrailLayer();
+		selectedMapFeature = feature;
+		nearbyMapFeatures = nearby;
+		nearbyTrailChoices = nearbyTrails;
+		coordinateCopyStatus = 'idle';
+		selectedFeatureElevationStatus = feature.elevationM == null ? 'loading' : 'ready';
+		syncSelectedMapFeatureLayer();
+		keepSelectedMapFeatureVisible();
+		void refreshWeather(feature.coordinates);
+
+		if (feature.elevationM != null || !map) return;
+		try {
+			const elevationM = await sampleTerrainElevation(map, feature.coordinates, controller.signal);
+			if (
+				controller.signal.aborted ||
+				requestVersion !== mapFeatureRequestVersion ||
+				selectedMapFeature?.id !== feature.id
+			) {
 				return;
 			}
+			if (elevationM == null) {
+				selectedFeatureElevationStatus = 'missing';
+				return;
+			}
+			selectedMapFeature = {
+				...selectedMapFeature,
+				elevationM,
+				elevationSource: 'terrain'
+			};
+			selectedFeatureElevationStatus = 'ready';
+		} catch {
+			if (requestVersion === mapFeatureRequestVersion) {
+				selectedFeatureElevationStatus = 'missing';
+			}
+		}
+	}
 
-			routeChoices = choices;
-			routeChooserPosition = routeChooserPositionFor(event.point, choices.length);
-		});
-
-		map.on('click', (event) => {
-			if (routeChoicesAtPoint(event.point).length === 0) {
-				clearRouteChoices();
+	function syncSelectedMapFeatureLayer() {
+		if (!map) return;
+		const features: GeoJsonFeature[] = selectedMapFeature
+			? [
+					{
+						type: 'Feature',
+						properties: { kind: selectedMapFeature.kind },
+						geometry: {
+							type: 'Point',
+							coordinates: selectedMapFeature.coordinates
+						}
+					}
+				]
+			: [];
+		const data: GeoJsonFeatureCollection = { type: 'FeatureCollection', features };
+		const source = map.getSource(SELECTED_MAP_FEATURE_SOURCE) as
+			| maplibregl.GeoJSONSource
+			| undefined;
+		if (source) {
+			source.setData(data as never);
+			return;
+		}
+		map.addSource(SELECTED_MAP_FEATURE_SOURCE, { type: 'geojson', data: data as never });
+		addLayerIfMissing({
+			id: SELECTED_MAP_FEATURE_GLOW_LAYER,
+			type: 'circle',
+			source: SELECTED_MAP_FEATURE_SOURCE,
+			paint: {
+				'circle-radius': ['interpolate', ['linear'], ['zoom'], 8, 10, 14, 14, 18, 17],
+				'circle-color': 'rgba(255, 249, 236, 0.72)',
+				'circle-blur': 0.35
 			}
 		});
-
-		map.on('mouseenter', 'trail-lines', () => {
-			map?.getCanvas().style.setProperty('cursor', 'pointer');
+		addLayerIfMissing({
+			id: SELECTED_MAP_FEATURE_LAYER,
+			type: 'circle',
+			source: SELECTED_MAP_FEATURE_SOURCE,
+			paint: {
+				'circle-radius': ['interpolate', ['linear'], ['zoom'], 8, 5, 14, 7, 18, 8],
+				'circle-color': '#2e6653',
+				'circle-stroke-color': '#fff9ec',
+				'circle-stroke-width': 2.5
+			}
 		});
+	}
 
-		map.on('mouseleave', 'trail-lines', () => {
-			map?.getCanvas().style.setProperty('cursor', '');
+	function clearSelectedMapFeatureLayer() {
+		selectedMapFeature = null;
+		nearbyMapFeatures = [];
+		nearbyTrailChoices = [];
+		selectedFeatureElevationStatus = 'idle';
+		coordinateCopyStatus = 'idle';
+		mapFeatureElevationAbortController?.abort();
+		mapFeatureElevationAbortController = null;
+		mapFeatureRequestVersion += 1;
+		if (!map) return;
+		const source = map.getSource(SELECTED_MAP_FEATURE_SOURCE) as
+			| maplibregl.GeoJSONSource
+			| undefined;
+		source?.setData({ type: 'FeatureCollection', features: [] });
+	}
+
+	function centerSelectedMapFeature() {
+		if (!map || !selectedMapFeature) return;
+		const mobile = (mapContainer?.clientWidth ?? window.innerWidth) <= 740;
+		map.easeTo({
+			center: selectedMapFeature.coordinates,
+			zoom: Math.max(map.getZoom(), 14),
+			offset: mobile ? [0, -110] : [220, 0],
+			duration: 650
 		});
-	});
+	}
+
+	function keepSelectedMapFeatureVisible() {
+		if (!map || !selectedMapFeature) return;
+		const projected = map.project(selectedMapFeature.coordinates);
+		const width = mapContainer?.clientWidth ?? window.innerWidth;
+		const height = mapContainer?.clientHeight ?? window.innerHeight;
+		const mobile = width <= 740;
+		const obscured = mobile ? projected.y > height * 0.48 : projected.x < Math.min(490, width * 0.48);
+		if (!obscured) return;
+		map.easeTo({
+			center: selectedMapFeature.coordinates,
+			offset: mobile ? [0, -110] : [220, 0],
+			duration: 420
+		});
+	}
+
+	async function copySelectedCoordinates() {
+		if (!selectedMapFeature) return;
+		const [longitude, latitude] = selectedMapFeature.coordinates;
+		try {
+			await navigator.clipboard.writeText(`${latitude.toFixed(6)}, ${longitude.toFixed(6)}`);
+			coordinateCopyStatus = 'copied';
+		} catch {
+			coordinateCopyStatus = 'error';
+		}
+	}
+
+	function featureCoordinateLabel(feature: MapFeatureSelection) {
+		const [longitude, latitude] = feature.coordinates;
+		return `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+	}
+
+	function selectNearbyMapFeature(feature: MapFeatureSelection) {
+		const current = selectedMapFeature;
+		const remaining = nearbyMapFeatures.filter((item) => item.id !== feature.id);
+		void selectMapFeature(
+			feature,
+			dedupeMapSelections(current ? [current, ...remaining] : remaining),
+			nearbyTrailChoices
+		);
+	}
+
+	function toggleMapPanel(panel: Exclude<MapPanel, null>) {
+		const opening = activeMapPanel !== panel;
+		activeMapPanel = opening ? panel : null;
+		terrainPanelOpen = activeMapPanel === 'terrain';
+	}
+
+	function preferredWeatherCoordinates(): LngLatTuple | null {
+		const trailCoordinates = selectedTrail?.start_point?.coordinates;
+		if (trailCoordinates) return trailCoordinates;
+		if (!map) return null;
+		const center = map.getCenter();
+		return [center.lng, center.lat];
+	}
+
+	async function refreshWeather(
+		coordinates = preferredWeatherCoordinates(),
+		force = false
+	) {
+		if (!coordinates) return;
+		if (!WEATHER_API_URL) {
+			weatherForecast = null;
+			weatherStatus = 'error';
+			weatherError = 'Weather service is not configured for this deployment.';
+			return;
+		}
+		weatherAbortController?.abort();
+		weatherAbortController = null;
+		const cacheKey = `${coordinates[0].toFixed(3)},${coordinates[1].toFixed(3)}`;
+		const cached = weatherCache.get(cacheKey);
+		if (!force && cached && cached.expiresAt > Date.now()) {
+			weatherForecast = cached.forecast;
+			weatherStatus = 'ready';
+			weatherError = null;
+			return;
+		}
+		const controller = new AbortController();
+		weatherAbortController = controller;
+		weatherStatus = 'loading';
+		weatherError = null;
+		try {
+			const forecast = await fetchWeatherForecast(
+				coordinates,
+				controller.signal,
+				10_000,
+				WEATHER_API_URL
+			);
+			if (weatherAbortController !== controller) return;
+			weatherForecast = forecast;
+			weatherCache.delete(cacheKey);
+			weatherCache.set(cacheKey, { forecast, expiresAt: Date.now() + 10 * 60 * 1000 });
+			while (weatherCache.size > 24) {
+				const oldestKey = weatherCache.keys().next().value;
+				if (typeof oldestKey !== 'string') break;
+				weatherCache.delete(oldestKey);
+			}
+			weatherStatus = 'ready';
+		} catch (error) {
+			if (controller.signal.aborted || weatherAbortController !== controller) return;
+			weatherStatus = 'error';
+			weatherError = error instanceof Error ? error.message : 'Weather forecast failed';
+		} finally {
+			if (weatherAbortController === controller) weatherAbortController = null;
+		}
+	}
+
+	function revealMapAfterInitialRender() {
+		if (!map) return;
+		map.once('idle', markMapVisualReady);
+		scheduleMapRevealFallback(3500);
+	}
+
+	function markMapVisualReady() {
+		if (mapVisualReady || componentDestroyed) return;
+		if (!map || !terrainReady || !map.isStyleLoaded()) return;
+		mapVisualReady = true;
+		mapLoadError = null;
+		if (mapRevealHandle) {
+			clearTimeout(mapRevealHandle);
+			mapRevealHandle = null;
+		}
+	}
+
+	function scheduleMapRevealFallback(delayMs: number) {
+		if (mapRevealHandle) clearTimeout(mapRevealHandle);
+		mapRevealHandle = setTimeout(() => {
+			markMapVisualReady();
+			if (!mapVisualReady && !componentDestroyed) {
+				mapLoadError = 'Map layers are taking too long to load. Check the basemap or terrain service and try again.';
+			}
+		}, delayMs);
+	}
+
+	function buildLegacyRasterStyle() {
+		if (!RASTER_TILE_URL_TEMPLATE) {
+			throw new Error(
+				'No production basemap configured. Set PUBLIC_BASEMAP_STYLE_URL or PUBLIC_RASTER_TILE_URL.'
+			);
+		}
+		if (!GLYPHS_URL) {
+			throw new Error(
+				'Raster basemaps require PUBLIC_MAP_GLYPHS_URL for trail, contour, and place labels.'
+			);
+		}
+		return {
+			version: 8,
+			glyphs: GLYPHS_URL,
+			sources: {
+				osm: {
+					type: 'raster',
+					tiles: [RASTER_TILE_URL_TEMPLATE],
+					tileSize: 256,
+					...(RASTER_TILE_ATTRIBUTION ? { attribution: RASTER_TILE_ATTRIBUTION } : {})
+				}
+			},
+			layers: [{ id: 'osm', type: 'raster', source: 'osm' }]
+		} satisfies maplibregl.StyleSpecification;
+	}
+
+	function addOutdoorContextLayers(
+		outdoorWaypointsUrl: string,
+		surfaceAnchorId?: string,
+		labelAnchorId?: string
+	) {
+		if (!map) return;
+		installAppOutdoorPoiImages(map);
+
+		if (!map.getSource('outdoor-waypoints')) {
+			map.addSource('outdoor-waypoints', buildOsmDerivedVectorSource(outdoorWaypointsUrl));
+		}
+
+		if (map.getSource('openmaptiles')) {
+			addLayerIfMissing(
+				{
+					id: OUTDOOR_ROCK_LAYER_ID,
+					type: 'fill',
+					source: 'openmaptiles',
+					'source-layer': 'landcover',
+					filter: ['==', ['get', 'class'], 'rock'],
+					paint: {
+						'fill-color': OUTDOOR_THEME.surface.rock,
+						'fill-opacity': 0.86,
+						'fill-outline-color': 'rgba(0, 0, 0, 0)'
+					}
+				},
+				surfaceAnchorId
+			);
+
+			for (const tier of [...PROVIDER_OUTDOOR_POI_TIERS].reverse()) {
+				addProviderOutdoorPoiTier(tier, labelAnchorId);
+			}
+		}
+
+		for (const [tierIndex, tier] of PEAK_LABEL_TIERS.entries()) {
+			addLayerIfMissing(
+				{
+					id: tier.id,
+					type: 'symbol',
+					source: 'outdoor-waypoints',
+					'source-layer': 'outdoor_waypoints',
+					minzoom: tier.minzoom,
+					filter: buildPeakTierFilter(tier) as maplibregl.FilterSpecification,
+					layout: {
+						'text-field': outdoorPeakTextField(terrainContourUnit),
+						'text-font': ['Noto Sans Bold'],
+						'text-size': tier.textSize as maplibregl.ExpressionSpecification,
+						'text-line-height': 1.08,
+						'text-max-width': 12,
+						'text-padding': tier.textPadding,
+						'text-pitch-alignment': 'map',
+						'text-rotation-alignment': 'viewport',
+						'text-allow-overlap': false,
+						'text-ignore-placement': false,
+						'symbol-avoid-edges': true,
+						'symbol-sort-key': [
+							'-',
+							10000,
+							['coalesce', ['to-number', ['get', 'elevation_m']], 0]
+						]
+					},
+					paint: {
+						'text-color': tierIndex === 0 ? '#49382B' : '#5A4939',
+						'text-halo-color': OUTDOOR_THEME.label.halo,
+						'text-halo-width': tierIndex === 0 ? 1.8 : 1.55,
+						'text-halo-blur': 0.35,
+						'text-opacity': tier.textOpacity as maplibregl.ExpressionSpecification
+					}
+				},
+				labelAnchorId
+			);
+		}
+
+		// Later symbol layers receive collision priority. Add lower-value local
+		// amenities first and emergency/overnight anchors last.
+		for (const tier of [...CUSTOM_OUTDOOR_POI_TIERS].reverse()) {
+			addCustomOutdoorPoiTier(tier, labelAnchorId);
+		}
+	}
+
+	function resolveOutdoorPoiAnchorId(): string | undefined {
+		if (!map) return mapLabelAnchorId;
+		return OUTDOOR_POI_LAYER_IDS.find((layerId) => map?.getLayer(layerId)) ?? mapLabelAnchorId;
+	}
+
+	function addCustomOutdoorPoiTier(tier: CustomOutdoorPoiTier, labelAnchorId?: string) {
+		addLayerIfMissing(
+			{
+				id: tier.id,
+				type: 'symbol',
+				source: 'outdoor-waypoints',
+				'source-layer': 'outdoor_waypoints',
+				minzoom: tier.minzoom,
+				filter: buildCustomPoiFilter(tier) as maplibregl.FilterSpecification,
+				layout: {
+					'icon-image': tier.icon,
+					'icon-size': [
+						'interpolate',
+						['linear'],
+						['zoom'],
+						tier.minzoom,
+						0.62,
+						15,
+						0.8,
+						17,
+						0.9
+					],
+					'icon-padding': 3,
+					'icon-allow-overlap': false,
+					'icon-ignore-placement': false,
+					'icon-optional': false,
+					'text-optional': true,
+					'text-anchor': 'top',
+					'text-field': poiLabelExpression(tier.labelMinzoom) as maplibregl.ExpressionSpecification,
+					'text-font': ['Noto Sans Bold'],
+					'text-size': ['interpolate', ['linear'], ['zoom'], 11, 9.5, 14, 10.5, 17, 11.5],
+					'text-offset': [0, 0.8],
+					'text-max-width': 11,
+					'text-padding': 4,
+					'text-pitch-alignment': 'map',
+					'text-rotation-alignment': 'viewport',
+					'text-allow-overlap': false,
+					'text-ignore-placement': false,
+					'symbol-avoid-edges': true,
+					'symbol-sort-key': ['case', ['has', 'name'], tier.priority, tier.priority + 1]
+				},
+				paint: outdoorPoiTextPaint(tier.kinds)
+			},
+			labelAnchorId
+		);
+	}
+
+	function addProviderOutdoorPoiTier(tier: ProviderOutdoorPoiTier, labelAnchorId?: string) {
+		for (const density of ['ranked', 'all'] as const) {
+			addLayerIfMissing(
+				{
+					id: providerPoiLayerId(tier.key, density),
+					type: 'symbol',
+					source: 'openmaptiles',
+					'source-layer': 'poi',
+					minzoom: density === 'ranked' ? tier.minzoom : PROVIDER_ALL_POIS_ZOOM,
+					maxzoom: density === 'ranked' ? PROVIDER_ALL_POIS_ZOOM : 24,
+					filter: buildProviderPoiFilter(tier, density) as maplibregl.FilterSpecification,
+					layout: {
+						'icon-image': PROVIDER_POI_ICON_EXPRESSION as maplibregl.ExpressionSpecification,
+						'icon-size': ['interpolate', ['linear'], ['zoom'], 14, 0.6, 17, 0.8, 19, 0.92],
+						'icon-padding': 3,
+						'icon-allow-overlap': false,
+						'icon-ignore-placement': false,
+						'icon-optional': false,
+						'text-optional': true,
+						'text-anchor': 'top',
+						'text-field': poiLabelExpression(tier.minzoom + 1) as maplibregl.ExpressionSpecification,
+						'text-font': ['Noto Sans Bold'],
+						'text-size': ['interpolate', ['linear'], ['zoom'], 14, 9.5, 17, 11.5, 19, 12],
+						'text-offset': [0, 0.82],
+						'text-max-width': 11,
+						'text-padding': 4,
+						'text-pitch-alignment': 'map',
+						'text-rotation-alignment': 'viewport',
+						'text-allow-overlap': false,
+						'text-ignore-placement': false,
+						'symbol-avoid-edges': true,
+						'symbol-sort-key': ['coalesce', ['to-number', ['get', 'rank']], 99]
+					},
+					paint: outdoorProviderPoiTextPaint() as never
+				},
+				labelAnchorId
+			);
+		}
+	}
+
+	function outdoorPoiTextPaint(kinds: readonly string[]) {
+		const water = kinds.includes('drinking_water') || kinds.includes('spring');
+		const emergency = kinds.some((kind) =>
+			['mountain_rescue', 'emergency_phone', 'first_aid_kit', 'defibrillator', 'hospital', 'clinic'].includes(kind)
+		);
+		return {
+			'text-color': emergency ? '#A63B32' : water ? OUTDOOR_THEME.label.water : OUTDOOR_THEME.label.secondary,
+			'text-halo-color': OUTDOOR_THEME.label.halo,
+			'text-halo-width': 1.6,
+			'text-halo-blur': 0.3
+		};
+	}
+
+	function outdoorProviderPoiTextPaint() {
+		return {
+			'text-color': [
+				'match',
+				['get', 'subclass'],
+				['drinking_water', 'waterfall'],
+				OUTDOOR_THEME.label.water,
+				['emergency_phone', 'first_aid_kit', 'defibrillator'],
+				'#A63B32',
+				OUTDOOR_THEME.label.secondary
+			],
+			'text-halo-color': OUTDOOR_THEME.label.halo,
+			'text-halo-width': 1.5,
+			'text-halo-blur': 0.3
+		};
+	}
+
+	function outdoorPeakTextField(unit: 'meters' | 'feet'): maplibregl.ExpressionSpecification {
+		const suffix = unit === 'feet' ? ' ft' : ' m';
+		const rawName = ['coalesce', ['get', 'name'], ''];
+		const displayName = [
+			'case',
+			['>', ['length', rawName], 34],
+			['concat', ['slice', rawName, 0, 34], '…'],
+			rawName
+		];
+		const elevation =
+			unit === 'feet'
+				? ['*', ['to-number', ['get', 'elevation_m']], 3.28084]
+				: ['to-number', ['get', 'elevation_m']];
+		return [
+			'concat',
+			'▲ ',
+			displayName,
+			[
+				'case',
+				['has', 'elevation_m'],
+				['concat', '\n', ['to-string', ['round', elevation]], suffix],
+				''
+			]
+		] as unknown as maplibregl.ExpressionSpecification;
+	}
+
+	function setOutdoorElevationUnit(unit: 'meters' | 'feet') {
+		if (!map) return;
+		for (const layerId of OUTDOOR_PEAK_LAYER_IDS) {
+			if (!map.getLayer(layerId)) continue;
+			map.setLayoutProperty(layerId, 'text-field', outdoorPeakTextField(unit) as never);
+		}
+	}
+
+	function addTrailNetworkLayers(trailTilesUrl: string, beforeLayerId?: string) {
+		if (!map) return;
+
+		if (!map.getSource('trails')) {
+			map.addSource('trails', buildOsmDerivedVectorSource(trailTilesUrl));
+		}
+
+		addKnownRouteLineLayer(
+			TRAIL_FALLBACK_CASING_LAYER,
+			null,
+			11.5,
+			[11.5, 2.4, 12, 2.8, 14, 3.7, 16, 4.5, 18, 5],
+			OUTDOOR_THEME.route.casing,
+			[11.5, 0.38, 12, 0.62, 13, 0.78, 14, 0.88],
+			beforeLayerId
+		);
+
+		addKnownRouteLineLayer(
+			TRAIL_LOCAL_CASING_LAYER,
+			['lwn'],
+			11,
+			[11, 2.4, 12, 2.8, 14, 3.7, 16, 4.5, 18, 5],
+			OUTDOOR_THEME.route.casing,
+			[11, 0.42, 12, 0.68, 13, 0.82, 14, 0.9],
+			beforeLayerId
+		);
+		addKnownRouteLineLayer(
+			TRAIL_REGIONAL_CASING_LAYER,
+			['rwn'],
+			9.5,
+			[9.5, 2, 10, 2.3, 12, 3.4, 14, 4.2, 16, 5, 18, 5.6],
+			OUTDOOR_THEME.route.casing,
+			[9.5, 0.34, 10, 0.62, 12, 0.84, 14, 0.92],
+			beforeLayerId
+		);
+		addKnownRouteLineLayer(
+			TRAIL_MAJOR_CASING_LAYER,
+			['iwn', 'nwn'],
+			8,
+			[8, 2.1, 10, 2.8, 12, 3.8, 14, 4.8, 16, 5.8, 18, 6.5],
+			OUTDOOR_THEME.route.casing,
+			[8, 0.46, 10, 0.72, 12, 0.88, 14, 0.94],
+			beforeLayerId
+		);
+
+		addKnownRouteLineLayer(
+			TRAIL_FALLBACK_LAYER,
+			null,
+			11.5,
+			[11.5, 0.85, 12, 1.25, 14, 1.8, 16, 2.4, 18, 2.9],
+			OUTDOOR_THEME.trail.local,
+			[11.5, 0.44, 12, 0.7, 13, 0.88, 14, 0.96],
+			beforeLayerId
+		);
+		addKnownRouteLineLayer(
+			TRAIL_LOCAL_LAYER,
+			['lwn'],
+			11,
+			[11, 0.9, 12, 1.35, 14, 1.9, 16, 2.5, 18, 3],
+			OUTDOOR_THEME.trail.local,
+			[11, 0.5, 12, 0.76, 13, 0.92, 14, 0.98],
+			beforeLayerId
+		);
+		addKnownRouteLineLayer(
+			TRAIL_REGIONAL_LAYER,
+			['rwn'],
+			9.5,
+			[9.5, 0.8, 10, 1.2, 12, 1.8, 14, 2.3, 16, 3, 18, 3.5],
+			OUTDOOR_THEME.trail.regional,
+			[9.5, 0.4, 10, 0.72, 12, 0.94, 14, 0.99],
+			beforeLayerId
+		);
+		addKnownRouteLineLayer(
+			TRAIL_MAJOR_LAYER,
+			['iwn', 'nwn'],
+			8,
+			[8, 1.2, 10, 1.7, 12, 2.2, 14, 2.8, 16, 3.6, 18, 4.2],
+			[
+				'match',
+				['get', 'network'],
+				'iwn',
+				OUTDOOR_THEME.trail.international,
+				OUTDOOR_THEME.trail.national
+			],
+			[8, 0.65, 10, 0.84, 12, 0.95, 14, 0.99],
+			beforeLayerId
+		);
+
+		addLayerIfMissing(
+			{
+				id: HOVERED_ROUTE_CASING_LAYER,
+				type: 'line',
+				source: 'trails',
+				'source-layer': 'trail_lines',
+				filter: ['==', ['get', 'id'], ''],
+				layout: {
+					'line-cap': 'round',
+					'line-join': 'round'
+				},
+				paint: {
+					'line-color': OUTDOOR_THEME.route.casing,
+					'line-width': ['interpolate', ['linear'], ['zoom'], 9, 5, 12, 6, 14, 7, 16, 8.5],
+					'line-opacity': 0.98,
+					'line-blur': 0.2
+				}
+			},
+			beforeLayerId
+		);
+		addLayerIfMissing(
+			{
+				id: HOVERED_ROUTE_LAYER,
+				type: 'line',
+				source: 'trails',
+				'source-layer': 'trail_lines',
+				filter: ['==', ['get', 'id'], ''],
+				layout: {
+					'line-cap': 'round',
+					'line-join': 'round'
+				},
+				paint: {
+					'line-color': OUTDOOR_THEME.route.selected,
+					'line-width': ['interpolate', ['linear'], ['zoom'], 9, 2.8, 12, 3.6, 14, 4.4, 16, 5.4],
+					'line-opacity': 0.98
+				}
+			},
+			beforeLayerId
+		);
+		addKnownRouteLabelLayer('trail-major-labels', ['iwn', 'nwn'], 10.5, true, beforeLayerId);
+		addKnownRouteLabelLayer('trail-regional-labels', ['rwn'], 11.5, false, beforeLayerId);
+		addKnownRouteLabelLayer('trail-local-labels', ['lwn'], 13, false, beforeLayerId);
+		addKnownRouteLabelLayer('trail-fallback-labels', null, 14, false, beforeLayerId);
+	}
+
+	function addKnownRouteLineLayer(
+		id: string,
+		networks: string[] | null,
+		minzoom: number,
+		widthStops: number[],
+		color: unknown,
+		opacityStops: number[],
+		beforeLayerId?: string
+	) {
+		addLayerIfMissing(
+			{
+				id,
+				type: 'line',
+				source: 'trails',
+				'source-layer': 'trail_lines',
+				minzoom,
+				filter: knownRouteNetworkFilter(networks),
+				layout: {
+					'line-cap': 'round',
+					'line-join': 'round'
+				},
+				paint: {
+					'line-color': color as never,
+					'line-width': ['interpolate', ['linear'], ['zoom'], ...widthStops] as never,
+					'line-opacity': ['interpolate', ['linear'], ['zoom'], ...opacityStops] as never
+				}
+			},
+			beforeLayerId
+		);
+	}
+
+	function addKnownRouteLabelLayer(
+		id: string,
+		networks: string[] | null,
+		minzoom: number,
+		uppercase: boolean,
+		beforeLayerId?: string
+	) {
+		addLayerIfMissing(
+			{
+				id,
+				type: 'symbol',
+				source: 'trails',
+				'source-layer': 'trail_lines',
+				minzoom,
+				filter: [
+					'all',
+					knownRouteNetworkFilter(networks),
+					['has', 'name'],
+					['!=', ['get', 'name'], '']
+				] as never,
+				layout: {
+					'symbol-placement': 'line',
+					'symbol-spacing': [
+						'interpolate',
+						['linear'],
+						['zoom'],
+						10,
+						900,
+						11,
+						700,
+						12,
+						560,
+						14,
+						450,
+						16,
+						340
+					],
+					'text-field': ['get', 'name'],
+					'text-font': ['Noto Sans Bold'],
+					'text-size': ['interpolate', ['linear'], ['zoom'], 10, 10.3, 12, 11, 14, 11.7, 16, 12.4],
+					'text-transform': uppercase ? 'uppercase' : 'none',
+					'text-letter-spacing': 0.01,
+					'text-max-angle': 30,
+					'text-padding': 6,
+					'text-pitch-alignment': 'map',
+					'text-rotation-alignment': 'viewport-glyph',
+					'text-allow-overlap': false,
+					'text-ignore-placement': false
+				},
+				paint: {
+					'text-color': OUTDOOR_THEME.trail.label,
+					'text-halo-color': OUTDOOR_THEME.route.casing,
+					'text-halo-width': 1.7,
+					'text-halo-blur': 0.3
+				}
+			},
+			beforeLayerId
+		);
+	}
+
+	function knownRouteNetworkFilter(networks: string[] | null): maplibregl.FilterSpecification {
+		if (networks) return ['in', ['get', 'network'], ['literal', networks]] as never;
+		return [
+			'!',
+			['in', ['coalesce', ['get', 'network'], ''], ['literal', [...KNOWN_NETWORKS]]]
+		] as never;
+	}
+
+	function applyWorkspaceLayerVisibility() {
+		if (!map) return;
+		for (const layerId of [
+			TRAIL_FALLBACK_CASING_LAYER,
+			TRAIL_FALLBACK_LAYER,
+			TRAIL_LOCAL_CASING_LAYER,
+			TRAIL_REGIONAL_CASING_LAYER,
+			TRAIL_MAJOR_CASING_LAYER,
+			HOVERED_ROUTE_CASING_LAYER,
+			HOVERED_ROUTE_LAYER,
+			...TRAIL_NETWORK_LAYER_IDS
+		]) {
+			setLayerVisibilitySafe(layerId, knownRoutesVisible);
+		}
+		for (const layerId of TRAIL_LABEL_LAYER_IDS) {
+			setLayerVisibilitySafe(layerId, knownRoutesVisible && routeLabelsVisible);
+		}
+		for (const layerId of OUTDOOR_POI_LAYER_IDS) {
+			setLayerVisibilitySafe(layerId, outdoorPoisVisible);
+		}
+		for (const layerId of OUTDOOR_PEAK_LAYER_IDS) {
+			setLayerVisibilitySafe(layerId, peakLabelsVisible);
+		}
+
+		for (const layer of styleLayers()) {
+			const id = layer.id.toLowerCase();
+			const sourceLayer = layer['source-layer']?.toLowerCase() ?? '';
+			if (/path_pedestrian/.test(id)) setLayerVisibilitySafe(layer.id, ordinaryPathsVisible);
+			if (layer.type === 'symbol' && isBasemapPoiLayer(layer.id, sourceLayer)) {
+				// The provider's general-purpose POI layers are replaced by the
+				// ranked outdoor hierarchy above; leaving both on causes duplicates
+				// and lets shops/cafes crowd out huts, rescue, and water.
+				setLayerVisibilitySafe(layer.id, false);
+			}
+			if (
+				layer.type === 'symbol' &&
+				(/mountain_peak/.test(sourceLayer) || /(^|[-_])(mountain|peak)([-_]|$)/.test(id))
+			) {
+				// Peaks are rendered from our imported OSM waypoint source. Keep the
+				// basemap's independent peak layer off so names/elevations cannot disagree.
+				setLayerVisibilitySafe(
+					layer.id,
+					OUTDOOR_PEAK_LAYER_ID_SET.has(layer.id) && peakLabelsVisible
+				);
+			}
+			if (
+				layer.type !== 'symbol' &&
+				(/boundary/.test(sourceLayer) || /(^|[-_])boundary|admin[-_]/.test(id))
+			) {
+				setLayerVisibilitySafe(layer.id, regionBoundariesVisible);
+			}
+		}
+	}
+
+	function setLayerVisibilitySafe(layerId: string, visible: boolean) {
+		if (!map?.getLayer(layerId)) return;
+		try {
+			map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
+		} catch {
+			// Third-party styles may make a layer immutable during a style transition.
+		}
+	}
+
+	function addLayerIfMissing(layer: maplibregl.LayerSpecification, beforeLayerId?: string) {
+		if (!map || map.getLayer(layer.id)) return;
+		const anchor = beforeLayerId && map.getLayer(beforeLayerId) ? beforeLayerId : undefined;
+		if (anchor) {
+			map.addLayer(layer, anchor);
+			return;
+		}
+		map.addLayer(layer);
+	}
+
+	function styleLayers() {
+		return ((map?.getStyle().layers ?? []) as RuntimeStyleLayer[]) ?? [];
+	}
+
+	function resolveLabelAnchorId() {
+		if (!map) return undefined;
+		if (BASEMAP_LABEL_ANCHOR_ID && map.getLayer(BASEMAP_LABEL_ANCHOR_ID)) {
+			return BASEMAP_LABEL_ANCHOR_ID;
+		}
+		return findFirstLabelAnchor(
+			styleLayers().map((layer) => ({
+				id: layer.id,
+				type: layer.type,
+				sourceLayer: layer['source-layer']
+			}))
+		);
+	}
+
+	function resolveTerrainAnchorId() {
+		return resolveTerrainOverlayAnchor(
+			styleLayers().map((layer) => ({
+				id: layer.id,
+				type: layer.type,
+				sourceLayer: layer['source-layer']
+			})),
+			TRAIL_LOCAL_CASING_LAYER
+		);
+	}
+
+	function tuneBasemapForTerrain() {
+		if (!map) return;
+
+		for (const layer of styleLayers()) {
+			const sourceLayer = layer['source-layer'] ?? '';
+
+			if (
+				shouldHideBasemapLayer({
+					id: layer.id,
+					type: layer.type,
+					sourceLayer
+				})
+			) {
+				safeSetLayoutProperty(layer.id, 'visibility', 'none');
+			}
+
+			for (const override of terrainBasemapPaintOverrides({
+				id: layer.id,
+				type: layer.type,
+				sourceLayer
+			})) {
+				safeSetPaintProperty(layer.id, override.property, override.value);
+			}
+		}
+	}
+
+	function safeSetPaintProperty(layerId: string, property: string, value: unknown) {
+		if (!map || !map.getLayer(layerId)) return;
+		try {
+			map.setPaintProperty(layerId, property, value as never);
+		} catch {
+			// Ignore style-specific property mismatches across third-party basemaps.
+		}
+	}
+
+	function safeSetLayoutProperty(layerId: string, property: string, value: unknown) {
+		if (!map || !map.getLayer(layerId)) return;
+		try {
+			map.setLayoutProperty(layerId, property, value as never);
+		} catch {
+			// Ignore style-specific property mismatches across third-party basemaps.
+		}
+	}
 
 	function absolutizeTileTemplate(template: string) {
 		if (typeof window === 'undefined') return template;
@@ -333,22 +1655,350 @@
 		return `${window.location.origin}/${template.replace(/^\.?\//, '')}`;
 	}
 
+	function sanitizeSearchResults(payload: unknown): SearchPayload {
+		const empty = { routes: [], places: [] } satisfies SearchPayload;
+		if (!payload || typeof payload !== 'object') return empty;
+
+		const value = payload as Record<string, unknown>;
+		const routes = Array.isArray(value.routes) ? value.routes : [];
+		const places = Array.isArray(value.places) ? value.places : [];
+
+		return {
+			routes: routes
+				.map((item) => {
+					const result = item as Record<string, unknown>;
+					const kind = result.kind === 'trail' ? 'trail' : null;
+					const id = typeof result.id === 'string' ? result.id : null;
+					const name = typeof result.name === 'string' ? result.name : null;
+					const subtitle = typeof result.subtitle === 'string' ? result.subtitle : null;
+					const network = typeof result.network === 'string' ? result.network : null;
+					const distance_m = typeof result.distance_m === 'number' ? result.distance_m : null;
+					const breadcrumb = Array.isArray(result.breadcrumb)
+						? result.breadcrumb.filter((entry): entry is string => typeof entry === 'string')
+						: [];
+
+					if (!kind || !id || !name) return null;
+
+					return {
+						kind,
+						id,
+						name,
+						subtitle,
+						network,
+						distance_m,
+						breadcrumb
+					} satisfies SearchRouteResult;
+				})
+				.filter((item): item is SearchRouteResult => item !== null),
+			places: places
+				.map((item) => {
+					const result = item as Record<string, unknown>;
+					const kind =
+						result.kind === 'region' ? 'region' : result.kind === 'place' ? 'place' : null;
+					const id = typeof result.id === 'string' ? result.id : null;
+					const name = typeof result.name === 'string' ? result.name : null;
+					const place_kind = typeof result.place_kind === 'string' ? result.place_kind : null;
+					const admin_label = typeof result.admin_label === 'string' ? result.admin_label : null;
+					const breadcrumb = Array.isArray(result.breadcrumb)
+						? result.breadcrumb.filter((entry): entry is string => typeof entry === 'string')
+						: [];
+					const bbox =
+						Array.isArray(result.bbox) &&
+						result.bbox.length === 4 &&
+						result.bbox.every((entry) => typeof entry === 'number')
+							? (result.bbox as [number, number, number, number])
+							: null;
+					const center =
+						Array.isArray(result.center) &&
+						result.center.length === 2 &&
+						result.center.every((entry) => typeof entry === 'number')
+							? (result.center as [number, number])
+							: null;
+
+					if (!kind || !id || !name) return null;
+
+					return {
+						kind,
+						id,
+						name,
+						place_kind,
+						admin_label,
+						breadcrumb,
+						bbox,
+						center
+					} satisfies SearchPlaceResult;
+				})
+				.filter((item): item is SearchPlaceResult => item !== null)
+		};
+	}
+
+	function closeSearchPanel() {
+		searchPanelOpen = false;
+		activeSearchIndex = -1;
+		searchLoading = false;
+		searchRequestVersion += 1;
+		if (searchDebounceHandle) {
+			clearTimeout(searchDebounceHandle);
+			searchDebounceHandle = null;
+		}
+		searchAbortController?.abort();
+		searchAbortController = null;
+	}
+
+	function clearSearchResults() {
+		searchRoutes = [];
+		searchPlaces = [];
+		searchResults = [];
+		searchLoading = false;
+		searchError = null;
+		activeSearchIndex = -1;
+	}
+
+	function resetSearch() {
+		searchQuery = '';
+		if (searchDebounceHandle) {
+			clearTimeout(searchDebounceHandle);
+			searchDebounceHandle = null;
+		}
+		clearSearchResults();
+		closeSearchPanel();
+		searchInput?.focus();
+	}
+
+	async function runSearch(term: string, requestVersion: number) {
+		const controller = new AbortController();
+		searchAbortController?.abort();
+		searchAbortController = controller;
+		try {
+			const params = new URLSearchParams({
+				q: term.trim(),
+				limit: '10'
+			});
+			const response = await requestJson<unknown>(`/api/search?${params.toString()}`, {
+				signal: controller.signal,
+				timeoutMs: 8_000
+			});
+			if (!response.ok) {
+				throw new Error(`Search request failed with ${response.status}`);
+			}
+
+			if (requestVersion !== searchRequestVersion) return;
+
+			const parsed = sanitizeSearchResults(response.data);
+			searchRoutes = parsed.routes;
+			searchPlaces = parsed.places;
+			searchResults = [...parsed.routes, ...parsed.places];
+			searchLoading = false;
+			searchError = null;
+			activeSearchIndex = searchResults.length > 0 ? 0 : -1;
+		} catch (error) {
+			if (controller.signal.aborted || isAbortError(error)) return;
+			if (requestVersion !== searchRequestVersion) return;
+			searchRoutes = [];
+			searchPlaces = [];
+			searchResults = [];
+			searchLoading = false;
+			searchError = error instanceof Error ? error.message : 'Search failed';
+			activeSearchIndex = -1;
+		} finally {
+			if (searchAbortController === controller) searchAbortController = null;
+		}
+	}
+
+	function queueSearch(term: string) {
+		const trimmed = term.trim();
+		searchPanelOpen = true;
+
+		if (searchDebounceHandle) {
+			clearTimeout(searchDebounceHandle);
+			searchDebounceHandle = null;
+		}
+		searchAbortController?.abort();
+		searchAbortController = null;
+
+		if (trimmed.length < SEARCH_MIN_CHARS) {
+			searchRequestVersion += 1;
+			searchLoading = false;
+			searchRoutes = [];
+			searchPlaces = [];
+			searchResults = [];
+			searchError = null;
+			activeSearchIndex = -1;
+			return;
+		}
+
+		searchLoading = true;
+		searchError = null;
+		const requestVersion = ++searchRequestVersion;
+		searchDebounceHandle = setTimeout(() => {
+			searchDebounceHandle = null;
+			void runSearch(trimmed, requestVersion);
+		}, 150);
+	}
+
+	function handleSearchInput(event: Event) {
+		searchQuery = (event.currentTarget as HTMLInputElement).value;
+		queueSearch(searchQuery);
+	}
+
+	function openSearchPanel() {
+		if (!mapVisualReady) return;
+		searchPanelOpen = true;
+		if (searchQuery.trim().length >= SEARCH_MIN_CHARS && !searchLoading && searchResults.length === 0) {
+			queueSearch(searchQuery);
+		}
+	}
+
+	function fitToSearchBounds(bbox: [number, number, number, number]) {
+		if (!map) return;
+		const [minLon, minLat, maxLon, maxLat] = bbox;
+		const mobile = window.innerWidth < 740;
+		map.fitBounds(
+			[
+				[minLon, minLat],
+				[maxLon, maxLat]
+			],
+			{
+				padding: {
+					top: 96,
+					right: mobile ? 24 : activeMapPanel ? 440 : 80,
+					bottom: 80,
+					left: mobile ? 24 : detailPanelOpen ? 460 : 80
+				},
+				duration: 850
+			}
+		);
+	}
+
+	function flyToSearchCenter(center: [number, number]) {
+		if (!map) return;
+		map.flyTo({
+			center,
+			zoom: Math.max(map.getZoom(), 11.5),
+			duration: 850
+		});
+	}
+
+	async function selectSearchResult(result: SearchResult) {
+		if (!mapVisualReady || !map?.isStyleLoaded()) return;
+		searchQuery = result.name;
+		closeSearchPanel();
+
+		if (result.kind === 'trail') {
+			await loadTrail(result.id);
+			return;
+		}
+
+		closePanel();
+		if (result.bbox) {
+			fitToSearchBounds(result.bbox);
+			return;
+		}
+
+		if (result.center) {
+			flyToSearchCenter(result.center);
+		}
+	}
+
+	async function confirmActiveSearchResult() {
+		const fallback = searchResults[0];
+		const result =
+			activeSearchIndex >= 0 && activeSearchIndex < searchResults.length
+				? searchResults[activeSearchIndex]
+				: fallback;
+		if (!result) return;
+		await selectSearchResult(result);
+	}
+
+	function handleSearchKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			closeSearchPanel();
+			return;
+		}
+
+		if (event.key === 'ArrowDown' && searchResults.length > 0) {
+			event.preventDefault();
+			activeSearchIndex = (activeSearchIndex + 1 + searchResults.length) % searchResults.length;
+			return;
+		}
+
+		if (event.key === 'ArrowUp' && searchResults.length > 0) {
+			event.preventDefault();
+			activeSearchIndex =
+				(activeSearchIndex - 1 + searchResults.length) % searchResults.length;
+			return;
+		}
+
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			void confirmActiveSearchResult();
+		}
+	}
+
+	function abortTrailRequests() {
+		trailRequestVersion += 1;
+		trailDetailAbortController?.abort();
+		trailDetailAbortController = null;
+		elevationAbortController?.abort();
+		elevationAbortController = null;
+		abortDownloadRequest();
+	}
+
+	function abortDownloadRequest() {
+		downloadRequestVersion += 1;
+		downloadAbortController?.abort();
+		downloadAbortController = null;
+		downloadBusy = false;
+	}
+
 	onDestroy(() => {
+		componentDestroyed = true;
+		if (typeof window !== 'undefined') window.removeEventListener('popstate', restoreLocation);
+		if (searchDebounceHandle) {
+			clearTimeout(searchDebounceHandle);
+		}
+		if (mapRevealHandle) {
+			clearTimeout(mapRevealHandle);
+		}
+		searchAbortController?.abort();
+		abortTrailRequests();
+		weatherAbortController?.abort();
+		mapFeatureElevationAbortController?.abort();
+		waypointMarker?.remove();
 		map?.remove();
 	});
 
-	async function loadTrail(trailId: string) {
-		const requestVersion = ++trailRequestVersion;
+	async function loadTrail(trailId: string, updateHistory = true, fit = true) {
+		waypointMarker?.remove();
+		shareMessage = ''; shareFallback = '';
+		searchPanelOpen = false;
+		abortTrailRequests();
+		const requestVersion = trailRequestVersion;
+		const controller = new AbortController();
+		trailDetailAbortController = controller;
 		detailError = null;
+		clearSelectedMapFeatureLayer();
+		weatherAbortController?.abort();
+		weatherAbortController = null;
+		weatherForecast = null;
+		weatherStatus = 'idle';
+		weatherError = null;
 
 		try {
 			clearRouteChoices();
-			const response = await fetch(`/api/trails/${trailId}`);
+			const response = await requestJson<TrailDetail>(`/api/trails/${trailId}?v=2`, {
+				cache: 'no-cache',
+				signal: controller.signal,
+				timeoutMs: 12_000
+			});
 			if (!response.ok) {
 				throw new Error(`Trail request failed with ${response.status}`);
 			}
 
-			const payload = await response.json();
+			const payload = response.data;
+			if (!payload || typeof payload !== 'object') {
+				throw new Error('Trail service returned invalid data');
+			}
 			if (requestVersion !== trailRequestVersion) return;
 
 			const trailDetail: TrailDetail = {
@@ -356,31 +2006,49 @@
 				stitch_warnings: sanitizeTrailWarnings(payload?.stitch_warnings)
 			};
 			selectedTrail = trailDetail;
+			navigationTrailId = trailId;
+			if (updateHistory) persistLocation(true);
+			if (trailDetail.start_point?.coordinates) {
+				void refreshWeather(trailDetail.start_point.coordinates);
+			}
 			elevationProfile = null;
 			elevationStatus = 'loading';
 			elevationError = null;
+			elevationHoverPosM = null;
+			elevationHoverEleM = null;
 			directionMode = defaultDirectionMode(trailDetail);
 			downloadFormat = 'gpx';
 			downloadSectionOpen = false;
 			downloadBusy = false;
 			downloadError = null;
-			void loadElevation(trailId);
-			syncSelectedTrailLayer();
-			fitToSelectedTrail();
+			void loadElevation(trailId, requestVersion);
+			if (fit) fitToSelectedTrail();
 		} catch (error) {
+			if (controller.signal.aborted || isAbortError(error)) return;
 			if (requestVersion !== trailRequestVersion) return;
 			selectedTrail = null;
 			clearSelectedTrailLayer();
 			detailError = error instanceof Error ? error.message : 'Failed to load trail details';
+		} finally {
+			if (trailDetailAbortController === controller) trailDetailAbortController = null;
 		}
 	}
 
-	async function loadElevation(trailId: string) {
+	async function loadElevation(trailId: string, requestVersion: number) {
+		elevationAbortController?.abort();
+		const controller = new AbortController();
+		elevationAbortController = controller;
 		elevationStatus = 'loading';
 		elevationError = null;
+		elevationHoverPosM = null;
+		elevationHoverEleM = null;
 
 		try {
-			const response = await fetch(`/api/trails/${trailId}/elevation`);
+			const response = await requestJson<Record<string, unknown>>(
+				`/api/trails/${trailId}/elevation?revision=${encodeURIComponent(selectedTrail?.data_revision ?? '')}`,
+				{ signal: controller.signal, timeoutMs: 12_000 }
+			);
+			if (controller.signal.aborted || requestVersion !== trailRequestVersion) return;
 			if (response.status === 404) {
 				if (selectedTrail?.id === trailId) {
 					elevationProfile = null;
@@ -392,7 +2060,8 @@
 				throw new Error(`Elevation request failed with ${response.status}`);
 			}
 
-			const payload = await response.json();
+			const payload = response.data;
+			if (!payload) throw new Error('Elevation service returned invalid data');
 			const profilePoints = sanitizeElevationPoints(payload?.profile_points);
 			const profile: ElevationProfile = {
 				min_elevation_m:
@@ -407,12 +2076,16 @@
 				elevationStatus = profilePoints.length > 0 ? 'ready' : 'missing';
 			}
 		} catch (error) {
+			if (controller.signal.aborted || isAbortError(error)) return;
+			if (requestVersion !== trailRequestVersion) return;
 			if (selectedTrail?.id === trailId) {
 				elevationProfile = null;
 				elevationStatus = 'error';
 				elevationError =
 					error instanceof Error ? error.message : 'Failed to load elevation profile';
 			}
+		} finally {
+			if (elevationAbortController === controller) elevationAbortController = null;
 		}
 	}
 
@@ -421,7 +2094,7 @@
 
 		const featureCollection = buildSelectedTrailFeatureCollection();
 		ensureDirectionArrowImage();
-		ensureBothDirectionImage();
+		const overlayAnchorId = resolveOutdoorPoiAnchorId();
 
 		const source = map.getSource(SELECTED_TRAIL_SOURCE) as maplibregl.GeoJSONSource | undefined;
 		if (source) {
@@ -431,56 +2104,109 @@
 				type: 'geojson',
 				data: featureCollection as never
 			});
-			map.addLayer({
-				id: SELECTED_TRAIL_GLOW_LAYER,
-				type: 'line',
-				source: SELECTED_TRAIL_SOURCE,
-				filter: ['==', ['get', 'role'], 'route'],
-				layout: {
-					'line-cap': 'round',
-					'line-join': 'round'
+			addLayerIfMissing(
+				{
+					id: SELECTED_TRAIL_GLOW_LAYER,
+					type: 'line',
+					source: SELECTED_TRAIL_SOURCE,
+					filter: ['==', ['get', 'role'], 'route'],
+					layout: {
+						'line-cap': 'round',
+						'line-join': 'round'
+					},
+					paint: {
+						'line-color': OUTDOOR_THEME.route.shadow,
+						'line-width': [
+							'interpolate',
+							['linear'],
+							['zoom'],
+							9,
+							7.5,
+							12,
+							8.5,
+							14,
+							10,
+							16,
+							12,
+							18,
+							14
+						],
+						'line-opacity': 0.92,
+						'line-blur': 0.65
+					}
 				},
-				paint: {
-					'line-color': '#55620e',
-					'line-width': 16,
-					'line-opacity': 0.32,
-					'line-blur': 1.2
-				}
-			});
-			map.addLayer({
-				id: SELECTED_TRAIL_CASING_LAYER,
-				type: 'line',
-				source: SELECTED_TRAIL_SOURCE,
-				filter: ['==', ['get', 'role'], 'route'],
-				layout: {
-					'line-cap': 'round',
-					'line-join': 'round'
+				overlayAnchorId
+			);
+			addLayerIfMissing(
+				{
+					id: SELECTED_TRAIL_CASING_LAYER,
+					type: 'line',
+					source: SELECTED_TRAIL_SOURCE,
+					filter: ['==', ['get', 'role'], 'route'],
+					layout: {
+						'line-cap': 'round',
+						'line-join': 'round'
+					},
+					paint: {
+						'line-color': OUTDOOR_THEME.route.casing,
+						'line-width': [
+							'interpolate',
+							['linear'],
+							['zoom'],
+							9,
+							5.5,
+							12,
+							6.5,
+							14,
+							7.5,
+							16,
+							9,
+							18,
+							10.5
+						],
+						'line-opacity': 0.98
+					}
 				},
-				paint: {
-					'line-color': '#78880f',
-					'line-width': 11,
-					'line-opacity': 0.98
-				}
-			});
-			map.addLayer({
-				id: SELECTED_TRAIL_LAYER,
-				type: 'line',
-				source: SELECTED_TRAIL_SOURCE,
-				filter: ['==', ['get', 'role'], 'route'],
-				layout: {
-					'line-cap': 'round',
-					'line-join': 'round'
+				overlayAnchorId
+			);
+			addLayerIfMissing(
+				{
+					id: SELECTED_TRAIL_LAYER,
+					type: 'line',
+					source: SELECTED_TRAIL_SOURCE,
+					filter: ['==', ['get', 'role'], 'route'],
+					layout: {
+						'line-cap': 'round',
+						'line-join': 'round'
+					},
+					paint: {
+						'line-color': OUTDOOR_THEME.route.selected,
+						'line-width': [
+							'interpolate',
+							['linear'],
+							['zoom'],
+							9,
+							3,
+							12,
+							4,
+							14,
+							4.8,
+							16,
+							5.8,
+							18,
+							7
+						],
+						'line-opacity': 0.98
+					}
 				},
-				paint: {
-					'line-color': '#dfff2a',
-					'line-width': 7.2,
-					'line-opacity': 0.98
-				}
-			});
-				map.addLayer({
+				overlayAnchorId
+			);
+			addLayerIfMissing(
+				{
 					id: SELECTED_TRAIL_ARROW_LAYER,
 					type: 'symbol',
 					source: SELECTED_TRAIL_SOURCE,
+					minzoom: 11,
 					filter: ['==', ['get', 'role'], 'direction-chevron'],
 					layout: {
 						'icon-image': SELECTED_TRAIL_ARROW_IMAGE,
@@ -488,102 +2214,181 @@
 							'interpolate',
 							['linear'],
 							['zoom'],
-							9,
-							0.62,
 							11,
-							0.75,
-							13,
-							0.88,
-							15,
-							1
+							0.9,
+							14,
+							1.1,
+							16,
+							1.25,
+							18,
+							1.35
 						],
 						'icon-rotation-alignment': 'map',
 						'icon-keep-upright': false,
 						'icon-allow-overlap': true,
 						'icon-ignore-placement': true,
 						'symbol-placement': 'line',
-						'symbol-spacing': 28
-					},
-					paint: {
-						'icon-opacity': 0.92
-					}
-				});
-				map.addLayer({
-					id: SELECTED_TRAIL_BOTH_LAYER,
-					type: 'symbol',
-					source: SELECTED_TRAIL_SOURCE,
-					filter: ['==', ['get', 'role'], 'direction-dot'],
-					layout: {
-						'icon-image': SELECTED_TRAIL_BOTH_IMAGE,
-						'icon-size': [
+						'symbol-spacing': [
 							'interpolate',
 							['linear'],
 							['zoom'],
-							9,
-							0.9,
 							11,
-							1.02,
-							13,
-							1.16,
-							15,
-							1.28
-						],
-						'icon-allow-overlap': true,
-						'icon-ignore-placement': true,
-						'symbol-placement': 'line',
-						'symbol-spacing': 30
+							160,
+							14,
+							110,
+							16,
+							72,
+							18,
+							56
+						]
 					},
 					paint: {
-						'icon-opacity': 0.9
+						'icon-opacity': 1
 					}
-				});
-				map.addLayer({
+				},
+				overlayAnchorId
+			);
+			addLayerIfMissing(
+				{
 					id: SELECTED_TRAIL_MARKER_LAYER,
-				type: 'circle',
-				source: SELECTED_TRAIL_SOURCE,
-				filter: ['==', ['get', 'role'], 'marker'],
-				paint: {
+					type: 'circle',
+					source: SELECTED_TRAIL_SOURCE,
+					filter: ['==', ['get', 'role'], 'marker'],
+					paint: {
 					'circle-radius': [
 						'match',
 						['get', 'kind'],
 						'start',
-						8,
-						'end',
-						8,
-						'open_end',
-						7,
-						'branch',
-						6,
-						'disconnected',
-						5,
-						6
-					],
+							8,
+							'end',
+							8,
+							'open_end',
+							7,
+							'branch',
+							6,
+							'disconnected',
+							5,
+							6
+						],
 					'circle-color': [
 						'match',
 						['get', 'kind'],
 						'start',
-						'#22c55e',
-						'end',
-						'#ef4444',
-						'open_end',
-						'#ef4444',
-						'branch',
-						'#67e8f9',
-						'disconnected',
-						'#9ca3af',
-						'#f8fafc'
-					],
+							OUTDOOR_THEME.route.start,
+							'end',
+							OUTDOOR_THEME.route.finish,
+							'open_end',
+							OUTDOOR_THEME.route.offRoute,
+							'branch',
+							'#67e8f9',
+							'disconnected',
+							'#9ca3af',
+							'#f8fafc'
+						],
 					'circle-stroke-color': '#ffffff',
 					'circle-stroke-width': 2
-				}
-			});
+					}
+				},
+				overlayAnchorId
+			);
+			addLayerIfMissing(
+				{
+					id: SELECTED_TRAIL_MARKER_LABEL_LAYER,
+					type: 'symbol',
+					source: SELECTED_TRAIL_SOURCE,
+					filter: [
+						'all',
+						['==', ['get', 'role'], 'marker'],
+						['in', ['get', 'kind'], ['literal', ['start', 'end']]]
+					],
+					layout: {
+						'text-field': ['get', 'label'],
+						'text-font': ['Noto Sans Bold'],
+						'text-size': [
+							'interpolate',
+							['linear'],
+							['zoom'],
+							9,
+							10.5,
+							12,
+							11.5,
+							14,
+							12
+						],
+						'text-anchor': 'top',
+						'text-offset': [0, 1.35],
+						'text-pitch-alignment': 'map',
+						'text-rotation-alignment': 'viewport',
+						'text-allow-overlap': true,
+						'text-ignore-placement': true
+					},
+					paint: {
+						'text-color': [
+							'match',
+							['get', 'kind'],
+							'start',
+							OUTDOOR_THEME.route.start,
+							OUTDOOR_THEME.route.finish
+						],
+						'text-halo-color': OUTDOOR_THEME.route.casing,
+						'text-halo-width': 2
+					}
+				},
+				overlayAnchorId
+			);
 		}
+	}
+
+	function syncProfileCursorLayer() {
+		if (!map || !map.isStyleLoaded()) return;
+		const source = map.getSource(SELECTED_TRAIL_CURSOR_SOURCE) as
+			| maplibregl.GeoJSONSource
+			| undefined;
+		if (!selectedTrail && !source) return;
+		const features: GeoJsonFeature[] = [];
+		if (
+			selectedTrail?.geometry &&
+			elevationHoverPosM != null &&
+			elevationHoverEleM != null
+		) {
+			const profileLength = elevationProfile?.profile_points.at(-1)?.pos_m ?? 0;
+			const hoverPoint = routeIndex?.at(profileLength > 0 ? elevationHoverPosM / profileLength : 0);
+			if (hoverPoint) {
+				features.push({
+					type: 'Feature',
+					properties: { kind: PROFILE_CURSOR_KIND },
+					geometry: { type: 'Point', coordinates: hoverPoint }
+				});
+			}
+		}
+
+		const data: GeoJsonFeatureCollection = { type: 'FeatureCollection', features };
+		if (source) {
+			source.setData(data as never);
+			return;
+		}
+
+		map.addSource(SELECTED_TRAIL_CURSOR_SOURCE, { type: 'geojson', data: data as never });
+		addLayerIfMissing(
+			{
+				id: SELECTED_TRAIL_CURSOR_LAYER,
+				type: 'circle',
+				source: SELECTED_TRAIL_CURSOR_SOURCE,
+				paint: {
+					'circle-radius': 9,
+					'circle-color': OUTDOOR_THEME.route.profileCursor,
+					'circle-stroke-color': 'rgba(255, 255, 255, 0.98)',
+					'circle-stroke-width': 3
+				}
+			},
+			resolveOutdoorPoiAnchorId()
+		);
 	}
 
 	function ensureDirectionArrowImage() {
 		if (!map || map.hasImage(SELECTED_TRAIL_ARROW_IMAGE)) return;
 
-		const size = 24;
+		const size = 28;
 		const canvas = document.createElement('canvas');
 		canvas.width = size;
 		canvas.height = size;
@@ -595,49 +2400,24 @@
 		context.translate(size / 2, size / 2);
 
 		context.beginPath();
-		context.moveTo(-4.8, -5.2);
-		context.lineTo(3.8, 0);
-		context.lineTo(-4.8, 5.2);
+		context.moveTo(-5.5, -6);
+		context.lineTo(4.8, 0);
+		context.lineTo(-5.5, 6);
 		context.lineJoin = 'round';
 		context.lineCap = 'round';
-		context.strokeStyle = 'rgba(128, 31, 31, 0.38)';
-		context.lineWidth = 5.2;
+		context.strokeStyle = OUTDOOR_THEME.route.directionOutline;
+		context.lineWidth = 5.5;
 		context.stroke();
 
 		context.beginPath();
-		context.moveTo(-4.8, -5.2);
-		context.lineTo(3.8, 0);
-		context.lineTo(-4.8, 5.2);
-		context.strokeStyle = 'rgba(239, 68, 68, 0.96)';
-		context.lineWidth = 2.7;
+		context.moveTo(-5.5, -6);
+		context.lineTo(4.8, 0);
+		context.lineTo(-5.5, 6);
+		context.strokeStyle = OUTDOOR_THEME.route.direction;
+		context.lineWidth = 2.8;
 		context.stroke();
 
 		map.addImage(SELECTED_TRAIL_ARROW_IMAGE, context.getImageData(0, 0, size, size), {
-			pixelRatio: 2
-		});
-	}
-
-	function ensureBothDirectionImage() {
-		if (!map || map.hasImage(SELECTED_TRAIL_BOTH_IMAGE)) return;
-
-		const size = 20;
-		const canvas = document.createElement('canvas');
-		canvas.width = size;
-		canvas.height = size;
-
-		const context = canvas.getContext('2d');
-		if (!context) return;
-
-		context.clearRect(0, 0, size, size);
-		context.beginPath();
-		context.arc(size / 2, size / 2, 3.8, 0, Math.PI * 2);
-		context.fillStyle = 'rgba(239, 68, 68, 0.96)';
-		context.fill();
-		context.lineWidth = 1.8;
-		context.strokeStyle = 'rgba(255, 245, 245, 0.95)';
-		context.stroke();
-
-		map.addImage(SELECTED_TRAIL_BOTH_IMAGE, context.getImageData(0, 0, size, size), {
 			pixelRatio: 2
 		});
 	}
@@ -691,7 +2471,7 @@
 			});
 		}
 
-		for (const diagnostic of selectedTrail?.stitch_diagnostics ?? []) {
+		for (const diagnostic of qaMode ? selectedTrail?.stitch_diagnostics ?? [] : []) {
 			if (
 				diagnostic.kind === 'open_end' &&
 				(pointMatches(diagnostic.geometry, selectedTrail?.start_point) ||
@@ -720,6 +2500,10 @@
 	function clearSelectedTrailLayer() {
 		const source = map?.getSource(SELECTED_TRAIL_SOURCE) as maplibregl.GeoJSONSource | undefined;
 		source?.setData(emptyFeatureCollection() as never);
+		const cursorSource = map?.getSource(SELECTED_TRAIL_CURSOR_SOURCE) as
+			| maplibregl.GeoJSONSource
+			| undefined;
+		cursorSource?.setData(emptyFeatureCollection() as never);
 	}
 
 	function emptyFeatureCollection(): GeoJsonFeatureCollection {
@@ -735,10 +2519,11 @@
 		const bounds = boundsForGeometry(selectedTrail.geometry);
 		if (!bounds) return;
 
-		const leftPadding = window.innerWidth < 740 ? 24 : 420;
+		const leftPadding = window.innerWidth < 740 ? 24 : 500;
+		const rightPadding = window.innerWidth < 740 ? 24 : activeMapPanel ? 440 : 72;
 
 		map.fitBounds(bounds, {
-			padding: { top: 72, right: 72, bottom: 72, left: leftPadding },
+			padding: { top: 72, right: rightPadding, bottom: window.innerWidth < 740 ? window.innerHeight * 0.6 : 72, left: leftPadding },
 			maxZoom: 14,
 			duration: 700
 		});
@@ -768,8 +2553,20 @@
 		}
 	}
 
+	function coordinateDistanceM(a: [number, number], b: [number, number]) {
+		const from = new maplibregl.LngLat(a[0], a[1]);
+		const to = new maplibregl.LngLat(b[0], b[1]);
+		return from.distanceTo(to);
+	}
+
 	function closePanel() {
+		waypointMarker?.remove();
+		navigationTrailId = null;
+		persistLocation(true);
+		shareMessage = ''; shareFallback = '';
+		abortTrailRequests();
 		selectedTrail = null;
+		clearSelectedMapFeatureLayer();
 		detailError = null;
 		directionMode = 'forward';
 		downloadFormat = 'gpx';
@@ -779,6 +2576,13 @@
 		elevationProfile = null;
 		elevationStatus = 'idle';
 		elevationError = null;
+		elevationHoverPosM = null;
+		elevationHoverEleM = null;
+		weatherAbortController?.abort();
+		weatherAbortController = null;
+		weatherForecast = null;
+		weatherStatus = 'idle';
+		weatherError = null;
 		clearRouteChoices();
 		clearSelectedTrailLayer();
 	}
@@ -855,12 +2659,13 @@
 	function previewPaddingForChooser() {
 		const viewportWidth = mapContainer?.clientWidth ?? window.innerWidth;
 		const chooserWidth = routeChooserPosition ? 360 : 72;
-		const panelWidth = selectedTrail || detailError ? Math.min(440, viewportWidth - 24) : 72;
+		const toolWidth = activeMapPanel ? 420 : 72;
+		const panelWidth = detailPanelOpen ? Math.min(460, viewportWidth - 24) : 72;
 		const chooserOnLeft =
 			routeChooserPosition != null &&
 			routeChooserPosition.x + Math.min(320, viewportWidth - 32) / 2 < viewportWidth / 2;
 		const left = chooserOnLeft ? Math.max(panelWidth, chooserWidth) : panelWidth;
-		const right = chooserOnLeft ? 72 : chooserWidth;
+		const right = Math.max(toolWidth, chooserOnLeft ? 72 : chooserWidth);
 
 		return {
 			top: 72,
@@ -872,13 +2677,17 @@
 
 	function routeChoicesAtPoint(point: maplibregl.Point) {
 		if (!map) return [];
+		const layers = [...TRAIL_NETWORK_LAYER_IDS, ...TRAIL_LABEL_LAYER_IDS].filter((layerId) =>
+			Boolean(map?.getLayer(layerId))
+		);
+		if (layers.length === 0) return [];
 
 		const rendered = map.queryRenderedFeatures(
 			[
 				[point.x - 6, point.y - 6],
 				[point.x + 6, point.y + 6]
 			],
-			{ layers: ['trail-lines'] }
+			{ layers }
 		);
 
 		const seen = new Set<string>();
@@ -886,7 +2695,9 @@
 
 		for (const feature of rendered) {
 			const properties = feature.properties ?? {};
-			const id = feature.id ?? properties.id;
+			// Martin's feature id can be the numeric relation primary key; the
+			// explicit `id` property is the UUID accepted by the trail API.
+			const id = properties.id ?? feature.id;
 			if (id == null) continue;
 
 			const trailId = String(id);
@@ -905,18 +2716,18 @@
 	}
 
 	function routeChooserPositionFor(point: maplibregl.Point, choiceCount: number) {
-		const panelWidth = 320;
-		const panelHeight = Math.min(440, 134 + choiceCount * 88);
 		const padding = 18;
 		const viewportWidth = mapContainer?.clientWidth ?? window.innerWidth;
 		const viewportHeight = mapContainer?.clientHeight ?? window.innerHeight;
+		const panelWidth = Math.max(0, Math.min(320, viewportWidth - padding * 2));
+		const panelHeight = Math.max(0, Math.min(440, 134 + choiceCount * 88, viewportHeight - padding * 2));
 		const leftPanelInset =
-			selectedTrail || detailError ? Math.min(420, viewportWidth - 32) + 28 : padding;
-		const minX = Math.min(leftPanelInset, Math.max(padding, viewportWidth - panelWidth - padding));
-		const maxX = viewportWidth - panelWidth - padding;
+			detailPanelOpen ? Math.min(460, viewportWidth - 32) + 28 : padding;
+		const maxX = Math.max(padding, viewportWidth - panelWidth - padding);
+		const minX = Math.min(leftPanelInset, maxX);
 		const minY = padding;
-		const maxY = viewportHeight - panelHeight - padding;
-		const prefersLeftColumn = !selectedTrail && !detailError && point.x > viewportWidth / 2;
+		const maxY = Math.max(padding, viewportHeight - panelHeight - padding);
+		const prefersLeftColumn = !detailPanelOpen && point.x > viewportWidth / 2;
 		const preferredX = prefersLeftColumn ? minX : maxX;
 		const preferredY = Math.min(maxY, Math.max(minY, point.y - panelHeight / 2));
 
@@ -943,13 +2754,11 @@
 		return `${hours} hr ${mins} min`;
 	}
 
-	function formatDistanceCompact(distanceM: number | null) {
-		if (distanceM == null || distanceM < 0) return '—';
-		if (distanceM === 0) return '0 m';
-		const km = distanceM / 1000;
-		if (km >= 10) return `${km.toFixed(0)} km`;
-		if (km >= 1) return `${km.toFixed(1)} km`;
-		return `${Math.round(distanceM)} m`;
+	function originalMapperProfileUrl(trail: TrailDetail) {
+		const explicit = normalizeExternalUrl(trail.original_mapper_profile_url);
+		if (explicit) return explicit;
+		if (trail.original_mapper_provider !== 'osm' || !trail.original_mapper_name) return null;
+		return `https://www.openstreetmap.org/user/${encodeURIComponent(trail.original_mapper_name)}`;
 	}
 
 	function sanitizeTrailWarnings(raw: unknown): TrailWarning[] {
@@ -966,21 +2775,21 @@
 	}
 
 	function difficultyLabel(value: string | null) {
-		if (!value) return 'Unrated';
+		if (!value) return 'Difficulty unknown';
 
 		switch (value) {
 			case 'hiking':
-				return 'Easy';
+				return 'Hiking · T1';
 			case 'mountain_hiking':
-				return 'Moderate';
+				return 'Mountain · T2';
 			case 'demanding_mountain_hiking':
-				return 'Challenging';
+				return 'Mountain · T3';
 			case 'alpine_hiking':
-				return 'Hard';
+				return 'Alpine · T4';
 			case 'demanding_alpine_hiking':
-				return 'Severe';
+				return 'Alpine · T5';
 			case 'difficult_alpine_hiking':
-				return 'Expert';
+				return 'Alpine · T6';
 			default:
 				return value.replaceAll('_', ' ');
 		}
@@ -1035,58 +2844,6 @@
 			})
 			.filter((item): item is ElevationPoint => item !== null)
 			.sort((a, b) => a.pos_m - b.pos_m);
-	}
-
-	function elevationChartMetrics(profile: ElevationProfile | null) {
-		const points = profile?.profile_points ?? [];
-		if (points.length === 0) return null;
-
-		const width = 320;
-		const height = 180;
-		const left = 8;
-		const right = 8;
-		const top = 10;
-		const bottom = 24;
-		const maxPos = points[points.length - 1]?.pos_m ?? 0;
-		const minEle =
-			profile?.min_elevation_m ?? Math.min(...points.map((point) => point.ele_m));
-		const maxEle =
-			profile?.max_elevation_m ?? Math.max(...points.map((point) => point.ele_m));
-		const eleRange = Math.max(1, maxEle - minEle);
-		const xScale = (pos: number) =>
-			left + (maxPos <= 0 ? 0 : (pos / maxPos) * (width - left - right));
-		const yScale = (ele: number) =>
-			top + ((maxEle - ele) / eleRange) * (height - top - bottom);
-		const line = points
-			.map((point, index) => `${index === 0 ? 'M' : 'L'} ${xScale(point.pos_m)} ${yScale(point.ele_m)}`)
-			.join(' ');
-		const area = `${line} L ${xScale(maxPos)} ${height - bottom} L ${xScale(0)} ${height - bottom} Z`;
-
-		return {
-			width,
-			height,
-			top,
-			bottom,
-			left,
-			right,
-			maxPos,
-			minEle,
-			maxEle,
-			line,
-			area,
-			startEle: points[0]?.ele_m ?? null,
-			endEle: points[points.length - 1]?.ele_m ?? null
-		};
-	}
-
-	function profileDistanceLabels(metrics: ReturnType<typeof elevationChartMetrics>) {
-		if (!metrics) return [];
-		const ticks = [0, 0.5, 1];
-		return ticks.map((fraction) => {
-			const pos = metrics.left + fraction * (metrics.width - metrics.left - metrics.right);
-			const distance = metrics.maxPos * fraction;
-			return { pos, label: formatDistanceCompact(distance) };
-		});
 	}
 
 	function directionSourceLabel(value: string | null | undefined) {
@@ -1226,14 +2983,16 @@
 	function directionFeatures(
 		geometry: TrailGeometry,
 		mode: DirectionMode
-	): Array<{ role: 'direction-chevron' | 'direction-dot'; geometry: TrailGeometry }> {
+	): Array<{ role: 'direction-chevron'; geometry: TrailGeometry }> {
 		switch (mode) {
 			case 'forward':
 				return [{ role: 'direction-chevron', geometry }];
 			case 'backward':
 				return [{ role: 'direction-chevron', geometry: reverseGeometry(geometry) }];
 			case 'both':
-				return [{ role: 'direction-dot', geometry }];
+				// A two-way trail has no prescribed travel direction. Repeated dots read
+				// like navigation instructions, so the route remains deliberately clean.
+				return [];
 		}
 	}
 
@@ -1262,27 +3021,73 @@
 	}
 
 	function toggleTerrainPanel() {
-		terrainPanelOpen = !terrainPanelOpen;
+		toggleMapPanel('terrain');
 	}
 
 	function toggleTerrain3d() {
 		terrain3dEnabled = !terrain3dEnabled;
-		if (terrain3dEnabled && map && map.getPitch() < 45) {
-			map.easeTo({ pitch: 55, duration: 700 });
+		if (!map) return;
+		map.setMaxPitch(85);
+		if (terrain3dEnabled) {
+			map.easeTo({
+				pitch: Math.max(map.getPitch(), 64),
+				bearing: Math.abs(map.getBearing()) < 2 ? -24 : map.getBearing(),
+				duration: 750
+			});
+		} else {
+			map.easeTo({ pitch: 0, bearing: 0, duration: 650 });
 		}
+	}
+
+	function setMapPitchValue(value: number) {
+		if (!map) return;
+		const pitch = Math.max(0, Math.min(82, value));
+		if (pitch > 0 && !terrain3dEnabled) terrain3dEnabled = true;
+		map.easeTo({ pitch, duration: 180 });
+	}
+
+	function setMapBearingValue(value: number) {
+		map?.easeTo({ bearing: value, duration: 180 });
+	}
+
+	function rotateMap(delta: number) {
+		map?.easeTo({ bearing: (map.getBearing() + delta) % 360, duration: 260 });
+	}
+
+	function set3DViewPreset(preset: 'terrain' | 'horizon') {
+		if (!map) return;
+		terrain3dEnabled = true;
+		map.setMaxPitch(85);
+		map.easeTo({
+			pitch: preset === 'horizon' ? 78 : 62,
+			bearing: Math.abs(map.getBearing()) < 2 ? -28 : map.getBearing(),
+			duration: 750
+		});
 	}
 
 	function setTerrainContoursEnabled(enabled: boolean) {
 		terrainContoursVisible = enabled;
 	}
 
-	function setTerrainHillshadeEnabled(enabled: boolean) {
-		terrainHillshadeVisible = enabled;
-	}
+		function setTerrainHillshadeEnabled(enabled: boolean) {
+			terrainHillshadeVisible = enabled;
+		}
 
-	function setTerrainContourUnit(unit: 'meters' | 'feet') {
-		terrainContourUnit = unit;
-	}
+		function setTerrainColorReliefEnabled(enabled: boolean) {
+			terrainColorReliefVisible = enabled;
+		}
+
+		function setTerrainSlopeEnabled(enabled: boolean) {
+			terrainSlopeVisible = enabled;
+		}
+
+		function setTerrainSlopeOpacity(value: number) {
+			terrainSlopeOpacity = Math.min(1, Math.max(0.25, value));
+		}
+
+		function setTerrainContourUnit(unit: 'meters' | 'feet') {
+			terrainContourUnit = unit;
+		}
 
 	function toggleDownloadSection() {
 		downloadSectionOpen = !downloadSectionOpen;
@@ -1319,1296 +3124,236 @@
 		return match?.[1] ?? null;
 	}
 
-	async function downloadRoute() {
-		if (!selectedTrail) return;
+	async function downloadRoute(formatOverride?: 'gpx' | 'kml' | 'geojson') {
+		const trail = selectedTrail;
+		if (!trail) return;
+		const format = formatOverride ?? downloadFormat;
+		const direction = directionMode;
+		abortDownloadRequest();
+		const requestVersion = downloadRequestVersion;
+		const controller = new AbortController();
+		downloadAbortController = controller;
 
 		downloadBusy = true;
 		downloadError = null;
 
 		try {
 			const params = new URLSearchParams({
-				format: downloadFormat,
-				direction: directionMode
+				format,
+				direction,
+				revision: trail.data_revision ?? ''
 			});
-			const response = await fetch(`/api/trails/${selectedTrail.id}/download?${params.toString()}`);
+			const response = await requestBlob(`/api/trails/${trail.id}/download?${params.toString()}`, {
+				signal: controller.signal,
+				timeoutMs: 30_000
+			});
+			if (controller.signal.aborted || requestVersion !== downloadRequestVersion) return;
 			if (!response.ok) {
-				throw new Error(`Download request failed with ${response.status}`);
+				throw new Error(response.status === 409 ? 'This route has changed. Reopen it before downloading.' : `Download request failed with ${response.status}`);
 			}
 
-			const blob = await response.blob();
+			if (!response.data || response.data.size === 0) {
+				throw new Error('Download service returned an empty file');
+			}
+			const blob = response.data;
 			const objectUrl = URL.createObjectURL(blob);
 			const link = document.createElement('a');
 			link.href = objectUrl;
 			link.download =
 				downloadFilenameFromHeader(response.headers.get('content-disposition')) ??
-				`${selectedTrail.id}.${downloadFormat}`;
+				`${trail.id}.${format}`;
 			document.body.appendChild(link);
 			link.click();
 			link.remove();
-			URL.revokeObjectURL(objectUrl);
+			setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 		} catch (error) {
+			if (controller.signal.aborted || requestVersion !== downloadRequestVersion || isAbortError(error)) {
+				return;
+			}
 			downloadError = error instanceof Error ? error.message : 'Failed to download route';
 		} finally {
-			downloadBusy = false;
+			if (downloadAbortController === controller && requestVersion === downloadRequestVersion) {
+				downloadAbortController = null;
+				downloadBusy = false;
+			}
 		}
 	}
 </script>
 
-<div class="map-shell">
-	<div bind:this={mapContainer} class="map"></div>
+<div
+	class:terrain-open={terrainPanelOpen}
+	class:tools-open={activeMapPanel !== null}
+	class:trail-open={detailPanelOpen}
+	class="map-shell"
+>
+	<div
+		bind:this={mapContainer}
+		class:ready={mapVisualReady}
+		class="map"
+		aria-busy={!mapVisualReady}
+	></div>
+	<MapLoadingCard isReady={mapVisualReady} error={mapLoadError} />
+
+	<SearchPanel
+		query={searchQuery}
+		panelOpen={searchPanelOpen}
+		isLoading={searchLoading}
+		isError={!!searchError}
+		errorMessage={searchError}
+		searchResults={searchResults}
+		searchRoutes={searchRoutes}
+		searchPlaces={searchPlaces}
+		activeSearchIndex={activeSearchIndex}
+		mapReady={mapVisualReady}
+		minChars={SEARCH_MIN_CHARS}
+		detailPanelOpen={detailPanelOpen}
+		onInput={handleSearchInput}
+		onFocus={openSearchPanel}
+		onKeydown={handleSearchKeydown}
+		onSelectResult={selectSearchResult}
+		onReset={resetSearch}
+	/>
+
+	<TrailDiscovery bounds={discoveryBounds} hidden={detailPanelOpen || searchPanelOpen || !mapVisualReady || activeMapPanel !== null} onselect={(id) => void loadTrail(id)} onhover={(id) => hoveredRouteChoiceId = id} />
 
 	<div class="terrain-dock">
-		<button
-			class:open={terrainPanelOpen}
-			class="terrain-dock-toggle"
-			type="button"
-			aria-expanded={terrainPanelOpen}
-			onclick={toggleTerrainPanel}
-		>
-			Terrain
-		</button>
+		<div class="map-tool-rail" role="toolbar" aria-label="Outdoor map tools">
+			<button class:active={activeMapPanel === 'layers'} type="button" onclick={() => toggleMapPanel('layers')} aria-label="Map layers" aria-pressed={activeMapPanel === 'layers'} title="Map layers">
+				<svg aria-hidden="true" viewBox="0 0 24 24"><path d="m4 8 8-4 8 4-8 4-8-4Zm0 4 8 4 8-4M4 16l8 4 8-4" /></svg>
+			</button>
+			<button class:active={activeMapPanel === 'terrain'} type="button" onclick={toggleTerrainPanel} aria-label="Terrain settings" aria-pressed={activeMapPanel === 'terrain'} title="Terrain settings">
+				<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3.5 17.5 8.5 9l3.2 4.2 2.4-3.1 6.4 7.4h-17Z" /><path d="m6.2 17.5 4-5.2" /></svg>
+			</button>
+			<button class:active={terrain3dEnabled} type="button" onclick={toggleTerrain3d} aria-label={terrain3dEnabled ? 'Turn off 3D terrain' : 'Turn on 3D terrain'} aria-pressed={terrain3dEnabled} disabled={!terrainReady} title={terrain3dEnabled ? 'Turn off 3D terrain' : 'Turn on 3D terrain'}>
+				<span class="tool-3d" aria-hidden="true">3D</span>
+			</button>
+		</div>
 
-		{#if terrainPanelOpen}
-			<div class="terrain-card">
+		{#if activeMapPanel}
+			<aside class="terrain-card map-tool-panel" aria-label={`${activeMapPanel} tools`}>
 				<div class="terrain-card-header">
 					<div>
-						<h3>Terrain view</h3>
-						<p>Hillshade, 3D relief, and client-side contours from one DEM source.</p>
+						<h3>{activeMapPanel === 'layers' ? 'Map layers' : 'Terrain'}</h3>
+						<p>{activeMapPanel === 'layers' ? 'Choose the outdoor information shown on the map.' : 'Adjust relief and contours. Use the 3D button on the map for perspective.'}</p>
 					</div>
+					<button class="tool-panel-close" type="button" onclick={() => toggleMapPanel(activeMapPanel as Exclude<MapPanel, null>)} aria-label="Close tools">×</button>
 				</div>
 
-				<div class="terrain-control-list">
-					<label class="terrain-switch">
-						<div>
-							<strong>3D terrain</strong>
-							<p>Lift the map surface from the DEM. Best seen when the camera tilts.</p>
-						</div>
-						<input
-							type="checkbox"
-							checked={terrain3dEnabled}
-							disabled={!terrainReady}
-							onchange={toggleTerrain3d}
-						/>
-					</label>
-
-					<label class="terrain-switch">
-						<div>
-							<strong>Hillshade</strong>
-							<p>Add shaded relief under the trails for clearer slopes and ridgelines.</p>
-						</div>
-						<input
-							type="checkbox"
-							checked={terrainHillshadeVisible}
-							disabled={!terrainReady}
-							onchange={(event) =>
-								setTerrainHillshadeEnabled((event.currentTarget as HTMLInputElement).checked)}
-						/>
-					</label>
-
-					<label class="terrain-switch">
-						<div>
-							<strong>Contours</strong>
-							<p>Generate contour lines in the browser from the same Terrain-RGB tiles.</p>
-						</div>
-						<input
-							type="checkbox"
-							checked={terrainContoursVisible}
-							disabled={!terrainReady}
-							onchange={(event) =>
-								setTerrainContoursEnabled((event.currentTarget as HTMLInputElement).checked)}
-						/>
-					</label>
-				</div>
-
-				<div class="terrain-fieldset">
-					<span class="terrain-fieldset-label">Contour unit</span>
-					<div class="terrain-segmented">
-						<label>
-							<input
-								type="radio"
-								name="terrain-unit"
-								checked={terrainContourUnit === 'meters'}
-								disabled={!terrainReady}
-								onchange={() => setTerrainContourUnit('meters')}
-							/>
-							<span>meters</span>
-						</label>
-						<label>
-							<input
-								type="radio"
-								name="terrain-unit"
-								checked={terrainContourUnit === 'feet'}
-								disabled={!terrainReady}
-								onchange={() => setTerrainContourUnit('feet')}
-							/>
-							<span>feet</span>
-						</label>
-					</div>
-				</div>
-
-				<div class="terrain-fieldset">
-					<div class="terrain-slider-row">
-						<span class="terrain-fieldset-label">Terrain exaggeration</span>
-						<strong>{terrainExaggeration.toFixed(1)}×</strong>
-					</div>
-					<input
-						class="terrain-slider"
-						type="range"
-						min="1"
-						max="2.4"
-						step="0.1"
-						bind:value={terrainExaggeration}
-						disabled={!terrainReady}
+				{#if activeMapPanel === 'layers'}
+					<LayersPanel
+						knownRoutesVisible={knownRoutesVisible}
+						routeLabelsVisible={routeLabelsVisible}
+						routeLabelsDisabled={!knownRoutesVisible}
+						ordinaryPathsVisible={ordinaryPathsVisible}
+						outdoorPoisVisible={outdoorPoisVisible}
+						peakLabelsVisible={peakLabelsVisible}
+						regionBoundariesVisible={regionBoundariesVisible}
+						onKnownRoutesToggle={(v) => (knownRoutesVisible = v)}
+						onRouteLabelsToggle={(v) => (routeLabelsVisible = v)}
+						onOrdinaryPathsToggle={(v) => (ordinaryPathsVisible = v)}
+						onOutdoorPoisToggle={(v) => (outdoorPoisVisible = v)}
+						onPeakLabelsToggle={(v) => (peakLabelsVisible = v)}
+						onRegionBoundariesToggle={(v) => (regionBoundariesVisible = v)}
 					/>
-				</div>
-
-				{#if !terrainReady}
-					<p class="terrain-status">Loading terrain controls…</p>
-				{:else if !terrainColorReliefSupported}
-					<p class="terrain-status">
-						Elevation tint is not enabled yet because the installed MapLibre version does not
-						support `color-relief` layers.
-					</p>
+				{:else if activeMapPanel === 'terrain'}
+					<TerrainControls
+						mapZoom={mapZoom}
+						mapPitch={mapPitch}
+						mapBearing={mapBearing}
+						terrain3dEnabled={terrain3dEnabled}
+						terrainReady={terrainReady}
+						terrainHillshadeVisible={terrainHillshadeVisible}
+						terrainColorReliefVisible={terrainColorReliefVisible}
+						terrainColorReliefSupported={terrainColorReliefSupported}
+						terrainSlopeVisible={terrainSlopeVisible}
+						terrainSlopeSupported={terrainSlopeSupported}
+						terrainSlopeOpacity={terrainSlopeOpacity}
+						terrainContoursVisible={terrainContoursVisible}
+						terrainContourUnit={terrainContourUnit}
+						onHillshadeToggle={setTerrainHillshadeEnabled}
+						onColorReliefToggle={setTerrainColorReliefEnabled}
+						onSlopeToggle={setTerrainSlopeEnabled}
+						onContoursToggle={setTerrainContoursEnabled}
+						onSlopeOpacityChange={setTerrainSlopeOpacity}
+						onContourUnitChange={setTerrainContourUnit}
+						onSet3DViewPreset={set3DViewPreset}
+						onMapPitchChange={setMapPitchValue}
+						onMapBearingChange={setMapBearingValue}
+						onRotateMap={rotateMap}
+					/>
 				{/if}
-			</div>
+			</aside>
 		{/if}
 	</div>
 
-	{#if routeChoices.length > 1 && routeChooserPosition}
-		<div
-			class="route-chooser"
-			style={`left:${routeChooserPosition.x}px;top:${routeChooserPosition.y}px;`}
-		>
-			<div class="route-chooser-header">
-				<h3>Routes here</h3>
-				<button class="route-chooser-close" onclick={clearRouteChoices} aria-label="Close route choices">×</button>
-			</div>
-			<p class="route-chooser-note">
-				Multiple trails share this section. Pick the specific route you want to inspect.
-			</p>
-			<div class="route-choice-list">
-				{#each routeChoices as choice}
-					<button
-						class:preview={hoveredRouteChoiceId === choice.id}
-						class="route-choice"
-						onmouseenter={() => previewRouteChoice(choice.id)}
-						onmouseleave={() => previewRouteChoice(null)}
-						onfocus={() => previewRouteChoice(choice.id)}
-						onblur={() => previewRouteChoice(null)}
-						onclick={() => loadTrail(choice.id)}
-					>
-						{#if choice.tag}
-							<span class="route-tag">{choice.tag}</span>
-						{/if}
-						<div>
-							<strong>{choice.name}</strong>
-							{#if choice.network}
-								<p>{choice.network}</p>
-							{/if}
-						</div>
-					</button>
-				{/each}
-			</div>
-		</div>
-	{/if}
+	<RouteChooser
+		choices={routeChoices}
+		position={routeChooserPosition}
+		hoveredId={hoveredRouteChoiceId}
+		onClose={clearRouteChoices}
+		onHover={previewRouteChoice}
+		onSelect={loadTrail}
+	/>
+
+	<FeaturePanel
+		selectedFeature={selectedMapFeature}
+		weatherForecast={weatherForecast}
+		weatherStatus={weatherStatus}
+		weatherError={weatherError}
+		nearbyFeatures={nearbyMapFeatures}
+		nearbyTrails={nearbyTrailChoices}
+		coordinateCopyStatus={coordinateCopyStatus}
+		onClose={closePanel}
+		onCenter={centerSelectedMapFeature}
+		onCopyCoordinates={copySelectedCoordinates}
+		onSelectNearby={selectNearbyMapFeature}
+		onLoadTrail={(id) => loadTrail(id)}
+		onRefreshWeather={(coords) => refreshWeather(coords ?? undefined, true)}
+	/>
 
 	{#if selectedTrail || detailError}
-		<aside class="trail-panel">
-			<button class="close" onclick={closePanel} aria-label="Close trail panel">×</button>
-
-			{#if detailError}
-				<p class="error">{detailError}</p>
-			{:else if selectedTrail}
-				{#if selectedTrail.region_breadcrumb.length > 0}
-					<p class="breadcrumb">{selectedTrail.region_breadcrumb.join(' › ')}</p>
-				{/if}
-
-				<div class="hero">
-					<p class="eyebrow">
-						{difficultyLabel(selectedTrail.difficulty)}
-						{#if selectedTrail.network}
-							<span>• {selectedTrail.network}</span>
-						{/if}
-					</p>
-					<h2>{selectedTrail.name ?? 'Unnamed trail'}</h2>
-					{#if selectedTrail.summary}
-						<p class="summary">{selectedTrail.summary}</p>
-					{/if}
-				</div>
-
-				<div class="stats">
-					<div>
-						<span>Length</span>
-						<strong>{formatDistance(selectedTrail.distance_m)}</strong>
-					</div>
-					<div>
-						<span>Estimated time</span>
-						<strong>{formatDuration(selectedTrail.estimated_duration_min)}</strong>
-					</div>
-					<div>
-						<span>Elevation gain</span>
-						<strong>{formatElevation(selectedTrail.ascent_m)}</strong>
-					</div>
-					<div>
-						<span>Hike type</span>
-						<strong>{hikeTypeLabel(selectedTrail.hike_type)}</strong>
-					</div>
-				</div>
-
-				<section class="section">
-					<h3>Elevation profile</h3>
-					{#if elevationStatus === 'loading'}
-						<div class="meta-card">
-							<strong>Loading profile…</strong>
-							<p>Fetching elevation samples for this route.</p>
-						</div>
-					{:else if elevationStatus === 'ready' && elevationProfile}
-						{@const metrics = elevationChartMetrics(elevationProfile)}
-						{#if metrics}
-							<div class="profile-shell">
-								<div class="profile-chart">
-									<svg viewBox={`0 0 ${metrics.width} ${metrics.height}`} aria-label="Elevation profile chart">
-										<defs>
-											<linearGradient id="elevation-fill" x1="0" x2="0" y1="0" y2="1">
-												<stop offset="0%" stop-color="rgba(223, 255, 42, 0.38)" />
-												<stop offset="100%" stop-color="rgba(223, 255, 42, 0.04)" />
-											</linearGradient>
-										</defs>
-										<line x1={metrics.left} y1={metrics.top} x2={metrics.left} y2={metrics.height - metrics.bottom} class="profile-axis" />
-										<line x1={metrics.left} y1={metrics.height - metrics.bottom} x2={metrics.width - metrics.right} y2={metrics.height - metrics.bottom} class="profile-axis" />
-										<line x1={metrics.left} y1={metrics.top} x2={metrics.width - metrics.right} y2={metrics.top} class="profile-grid" />
-										<line x1={metrics.left} y1={(metrics.top + (metrics.height - metrics.bottom)) / 2} x2={metrics.width - metrics.right} y2={(metrics.top + (metrics.height - metrics.bottom)) / 2} class="profile-grid" />
-										<line x1={metrics.left} y1={metrics.height - metrics.bottom} x2={metrics.width - metrics.right} y2={metrics.height - metrics.bottom} class="profile-grid" />
-										<path d={metrics.area} class="profile-area" />
-										<path d={metrics.line} class="profile-line" />
-										{#each profileDistanceLabels(metrics) as tick}
-											<text x={tick.pos} y={metrics.height - 6} class="profile-label" text-anchor="middle">
-												{tick.label}
-											</text>
-										{/each}
-										<text x={metrics.left} y={metrics.top - 1} class="profile-label" text-anchor="start">
-											{formatElevation(metrics.maxEle)}
-										</text>
-										<text x={metrics.left} y={metrics.height - metrics.bottom - 4} class="profile-label" text-anchor="start">
-											{formatElevation(metrics.minEle)}
-										</text>
-									</svg>
-								</div>
-								<div class="meta-grid profile-meta-grid">
-									<div class="meta-card">
-										<span>Start</span>
-										<strong>{formatElevation(metrics.startEle)}</strong>
-									</div>
-									<div class="meta-card">
-										<span>Peak</span>
-										<strong>{formatElevation(metrics.maxEle)}</strong>
-									</div>
-									<div class="meta-card">
-										<span>Finish</span>
-										<strong>{formatElevation(metrics.endEle)}</strong>
-									</div>
-									<div class="meta-card">
-										<span>Profile length</span>
-										<strong>{formatDistanceCompact(metrics.maxPos)}</strong>
-									</div>
-								</div>
-							</div>
-						{/if}
-					{:else if elevationStatus === 'missing'}
-						<div class="meta-card">
-							<strong>No elevation profile yet</strong>
-							<p>This trail does not have generated elevation samples yet. Re-run the importer with `DEM_PATH` configured to populate this route.</p>
-						</div>
-					{:else if elevationStatus === 'error'}
-						<div class="meta-card">
-							<strong>Couldn’t load profile</strong>
-							<p>{elevationError ?? 'Something went wrong while loading the elevation profile.'}</p>
-						</div>
-					{/if}
-				</section>
-
-				{#if selectedTrail.features.length > 0}
-					<section class="section">
-						<h3>What to expect</h3>
-						<div class="chips">
-							{#each selectedTrail.features as feature}
-								<span class="chip">{featureLabel(feature)}</span>
-							{/each}
-						</div>
-					</section>
-				{/if}
-
-				{#if selectedTrail.route_from || selectedTrail.route_to || selectedTrail.route_via || selectedTrail.route_tag || selectedTrail.network_type || selectedTrail.website_url || selectedTrail.video_url || selectedTrail.direction_source}
-					<section class="section">
-						<h3>Route details</h3>
-						<div class="meta-grid">
-							{#if selectedTrail.route_from || selectedTrail.route_to}
-								<div class="meta-card meta-card-wide">
-									<span>Route path</span>
-									<strong>{directionLabel('forward', selectedTrail)}</strong>
-								</div>
-							{/if}
-							{#if selectedTrail.route_tag}
-								<div class="meta-card">
-									<span>Route tag</span>
-									<strong>{selectedTrail.route_tag}</strong>
-								</div>
-							{/if}
-							{#if selectedTrail.network_type}
-								<div class="meta-card">
-									<span>Network type</span>
-									<strong>{selectedTrail.network_type}</strong>
-								</div>
-							{/if}
-							{#if selectedTrail.direction_source}
-								<div class="meta-card">
-									<span>Direction basis</span>
-									<strong>{directionSourceLabel(selectedTrail.direction_source)}</strong>
-								</div>
-							{/if}
-							{#if normalizeExternalUrl(selectedTrail.website_url)}
-								<div class="meta-card meta-card-wide">
-									<span>Website</span>
-									<a class="meta-link" href={normalizeExternalUrl(selectedTrail.website_url)} target="_blank" rel="noreferrer">
-										{normalizeExternalUrl(selectedTrail.website_url)}
-									</a>
-								</div>
-							{/if}
-							{#if normalizeExternalUrl(selectedTrail.video_url)}
-								<div class="meta-card meta-card-wide">
-									<span>Video</span>
-									<a class="meta-link" href={normalizeExternalUrl(selectedTrail.video_url)} target="_blank" rel="noreferrer">
-										{normalizeExternalUrl(selectedTrail.video_url)}
-									</a>
-								</div>
-							{/if}
-						</div>
-					</section>
-				{/if}
-
-				<section class="section download-section">
-					<button
-						class="section-toggle"
-						type="button"
-						aria-expanded={downloadSectionOpen}
-						onclick={toggleDownloadSection}
-					>
-						<span class="section-title">Download route</span>
-						<span class:open={downloadSectionOpen}>⌄</span>
-					</button>
-
-					{#if downloadSectionOpen}
-						<p class="analysis-note">
-							Choose an export format and travel direction. The red arrows on the map update to preview the selected direction.
-						</p>
-
-						<div class="download-fieldset">
-							<span class="fieldset-label">Format</span>
-							<div class="radio-list format-list">
-								<label>
-									<input type="radio" bind:group={downloadFormat} value="gpx" />
-									<span>GPX</span>
-								</label>
-								<label>
-									<input type="radio" bind:group={downloadFormat} value="kml" />
-									<span>KML</span>
-								</label>
-								<label>
-									<input type="radio" bind:group={downloadFormat} value="geojson" />
-									<span>GeoJSON</span>
-								</label>
-							</div>
-						</div>
-
-						<div class="download-fieldset">
-							<span class="fieldset-label">Include ways in direction</span>
-							<div class="radio-list direction-list">
-								<label>
-									<input
-										type="radio"
-										name="direction"
-										checked={directionMode === 'forward'}
-										onchange={() => setDirection('forward')}
-									/>
-									<div>
-										<strong>forwards</strong>
-										<p>{directionLabel('forward', selectedTrail)}</p>
-									</div>
-								</label>
-								<label>
-									<input
-										type="radio"
-										name="direction"
-										checked={directionMode === 'backward'}
-										onchange={() => setDirection('backward')}
-									/>
-									<div>
-										<strong>backwards</strong>
-										<p>{directionLabel('backward', selectedTrail)}</p>
-									</div>
-								</label>
-								<label>
-									<input
-										type="radio"
-										name="direction"
-										checked={directionMode === 'both'}
-										onchange={() => setDirection('both')}
-									/>
-									<div>
-										<strong>both</strong>
-										<p>{directionLabel('both', selectedTrail)}</p>
-									</div>
-								</label>
-							</div>
-						</div>
-
-						<button class="download-button" type="button" disabled={downloadBusy} onclick={downloadRoute}>
-							{downloadBusy ? 'Preparing file…' : 'Get file'}
-						</button>
-
-						{#if downloadError}
-							<p class="download-error">{downloadError}</p>
-						{/if}
-					{/if}
-				</section>
-
-				{#if selectedTrail.start_point || selectedTrail.end_point || selectedTrail.stitch_warnings.length > 0}
-					<section class="section">
-						<h3>Analyze relation</h3>
-						<p class="analysis-note">
-							This route was reconstructed from OSM relation members. Markers and warnings highlight places where the computed path may need review.
-						</p>
-						<div class="analysis-list">
-							{#if selectedTrail.start_point}
-								<div class="analysis-item">
-									<span class="dot start-dot"></span>
-									<div>
-										<strong>Start point</strong>
-										<p>Green marker on the map. Open Download route to preview red direction arrows from here.</p>
-									</div>
-								</div>
-							{/if}
-							{#if selectedTrail.end_point}
-								<div class="analysis-item">
-									<span class="dot end-dot"></span>
-									<div>
-										<strong>Finish point</strong>
-										<p>Red marker on the map marks the end of the currently stitched route.</p>
-									</div>
-								</div>
-							{/if}
-							{#if diagnosticCount('branch') > 0}
-								<div class="analysis-item">
-									<span class="dot branch-dot"></span>
-									<div>
-										<strong>{diagnosticCount('branch')} branch point{diagnosticCount('branch') === 1 ? '' : 's'}</strong>
-										<p>Blue markers show junctions where more than two route segments meet.</p>
-									</div>
-								</div>
-							{/if}
-							{#if diagnosticCount('open_end') > 0}
-								<div class="analysis-item">
-									<span class="dot warning-dot"></span>
-									<div>
-										<strong>{diagnosticCount('open_end')} open end{diagnosticCount('open_end') === 1 ? '' : 's'}</strong>
-										<p>These points mark route ends where the computed path does not continue.</p>
-									</div>
-								</div>
-							{/if}
-							{#if diagnosticCount('disconnected') > 0}
-								<div class="analysis-item">
-									<span class="dot disconnected-dot"></span>
-									<div>
-										<strong>{diagnosticCount('disconnected')} disconnected point{diagnosticCount('disconnected') === 1 ? '' : 's'}</strong>
-										<p>Gray markers show broken-off pieces that were not part of the main stitched path.</p>
-									</div>
-								</div>
-							{/if}
-							{#each warningSummaries(selectedTrail.stitch_warnings) as summary}
-								<div class="analysis-item warning-item">
-									<span class="dot warning-dot"></span>
-									<div>
-										<strong>
-											{summary.title}
-											{#if summary.count > 1}
-												<span class="count-pill">{summary.count}</span>
-											{/if}
-										</strong>
-										<p>{summary.description}</p>
-									</div>
-								</div>
-							{/each}
-						</div>
-					</section>
-				{/if}
-
-				{#if selectedTrail.surfaces.length > 0}
-					<section class="section">
-						<h3>Surfaces</h3>
-						<div class="surface-bar">
-							{#each selectedTrail.surfaces as surface}
-								<div
-									class="surface-segment"
-									style={`width:${surface.pct}%;background:${surfaceColor(surface.surface_type)}`}
-								></div>
-							{/each}
-						</div>
-						<div class="surface-list">
-							{#each selectedTrail.surfaces as surface}
-								<div class="surface-item">
-									<span class="dot" style={`background:${surfaceColor(surface.surface_type)}`}></span>
-									<div>
-										<strong>{surfaceLabel(surface.surface_type)}</strong>
-										<p>{surface.pct.toFixed(0)}% · {formatDistance(surface.distance_m)}</p>
-									</div>
-								</div>
-							{/each}
-						</div>
-					</section>
-				{/if}
-			{/if}
-		</aside>
+		<TrailDetailPanel
+			selectedTrail={selectedTrail}
+			qaMode={qaMode}
+			downloadSectionOpen={downloadSectionOpen}
+			downloadFormat={downloadFormat}
+			directionMode={directionMode}
+			mapperProfileUrl={selectedTrail ? originalMapperProfileUrl(selectedTrail) : null}
+			directionLabel={(mode) => selectedTrail ? directionLabel(mode, selectedTrail) : mode}
+			formatFeatureLabel={featureLabel}
+			formatSurfaceLabel={surfaceLabel}
+			surfaceColor={surfaceColor}
+			formatDistance={formatDistance}
+			warningSummaries={warningSummaries(selectedTrail?.stitch_warnings ?? [])}
+			incompleteRoute={incompleteRoute}
+			downloadBusy={downloadBusy}
+			shareMessage={shareMessage}
+			shareFallback={shareFallback}
+			downloadError={downloadError}
+			elevationStatus={elevationStatus}
+			elevationProfile={elevationProfile}
+			weatherForecast={weatherForecast}
+			weatherStatus={weatherStatus}
+			weatherError={weatherError}
+			detailError={detailError}
+			difficultyLabel={difficultyLabel(selectedTrail?.difficulty ?? null)}
+			hikeTypeLabel={hikeTypeLabel(selectedTrail?.hike_type ?? null)}
+			distanceLabel={formatDistance(selectedTrail?.distance_m ?? null)}
+			ascentLabel={formatElevation(selectedTrail?.ascent_m ?? null)}
+			descentLabel={formatElevation(selectedTrail?.descent_m ?? null)}
+			durationLabel={formatDuration(selectedTrail?.estimated_duration_min ?? null)}
+			onClose={closePanel}
+			onCenter={fitToSelectedTrail}
+			onShare={shareTrail}
+			onExportGPX={() => downloadRoute("gpx")}
+			onExport={() => downloadRoute()}
+			onToggleDownload={toggleDownloadSection}
+			onFormatChange={(format) => downloadFormat = format}
+			onDirectionChange={setDirection}
+			onReloadRoute={() => selectedTrail && loadTrail(selectedTrail.id, false, false)}
+			onShowWaypoint={showWaypoint}
+			onRefreshWeather={(coords) => refreshWeather(coords ?? undefined, true)}
+			onElevationHover={(point) => { elevationHoverPosM = point?.pos_m ?? null; elevationHoverEleM = point?.ele_m ?? null; }}
+		/>
 	{/if}
 </div>
-
-<style>
-	:global(.maplibregl-popup-content) {
-		font-family: inherit;
-	}
-
-	.map-shell {
-		position: relative;
-		width: 100%;
-		height: 100%;
-		overflow: hidden;
-		background:
-			radial-gradient(circle at top left, rgba(49, 80, 84, 0.22), transparent 28%),
-			radial-gradient(circle at bottom right, rgba(177, 122, 69, 0.18), transparent 30%),
-			#10141a;
-	}
-
-	.map {
-		width: 100%;
-		height: 100%;
-	}
-
-	.terrain-dock {
-		position: absolute;
-		top: 4.5rem;
-		right: 1rem;
-		z-index: 3;
-		display: flex;
-		flex-direction: column;
-		align-items: flex-end;
-		gap: 0.7rem;
-	}
-
-	.terrain-dock-toggle {
-		padding: 0.72rem 1rem;
-		border: 1px solid rgba(255, 255, 255, 0.12);
-		border-radius: 999px;
-		background: rgba(17, 22, 30, 0.88);
-		backdrop-filter: blur(12px);
-		color: #eef1f3;
-		font-size: 0.92rem;
-		font-weight: 700;
-		cursor: pointer;
-		box-shadow: 0 16px 30px rgba(0, 0, 0, 0.28);
-		transition:
-			transform 120ms ease,
-			border-color 120ms ease,
-			background 120ms ease;
-	}
-
-	.terrain-dock-toggle:hover,
-	.terrain-dock-toggle.open {
-		transform: translateY(-1px);
-		border-color: rgba(223, 255, 42, 0.45);
-		background: rgba(24, 31, 40, 0.94);
-	}
-
-	.terrain-card {
-		width: min(340px, calc(100vw - 2rem));
-		padding: 1rem;
-		border: 1px solid rgba(255, 255, 255, 0.1);
-		border-radius: 20px;
-		background: rgba(17, 22, 30, 0.92);
-		backdrop-filter: blur(14px);
-		box-shadow: 0 22px 44px rgba(0, 0, 0, 0.34);
-		color: #eef1f3;
-	}
-
-	.terrain-card-header h3 {
-		margin: 0;
-		font-size: 1rem;
-	}
-
-	.terrain-card-header p {
-		margin: 0.35rem 0 0;
-		color: #aeb6c1;
-		font-size: 0.88rem;
-		line-height: 1.45;
-	}
-
-	.terrain-control-list {
-		display: grid;
-		gap: 0.75rem;
-		margin-top: 0.95rem;
-	}
-
-	.terrain-switch {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: 0.9rem;
-		padding: 0.85rem 0.9rem;
-		border-radius: 16px;
-		background: rgba(255, 255, 255, 0.04);
-	}
-
-	.terrain-switch strong {
-		display: block;
-		font-size: 0.95rem;
-	}
-
-	.terrain-switch p {
-		margin: 0.24rem 0 0;
-		color: #9ca8b6;
-		font-size: 0.84rem;
-		line-height: 1.4;
-	}
-
-	.terrain-switch input[type='checkbox'] {
-		margin-top: 0.2rem;
-		width: 1rem;
-		height: 1rem;
-		accent-color: #dfff2a;
-	}
-
-	.terrain-fieldset {
-		margin-top: 0.9rem;
-		padding: 0.9rem;
-		border-radius: 16px;
-		background: rgba(255, 255, 255, 0.05);
-	}
-
-	.terrain-fieldset-label {
-		display: block;
-		font-size: 0.78rem;
-		letter-spacing: 0.05em;
-		text-transform: uppercase;
-		color: #9ca8b6;
-	}
-
-	.terrain-slider-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 0.75rem;
-	}
-
-	.terrain-slider-row strong {
-		color: #dfff2a;
-		font-size: 0.95rem;
-	}
-
-	.terrain-segmented {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: 0.65rem;
-		margin-top: 0.7rem;
-	}
-
-	.terrain-segmented label {
-		display: flex;
-		align-items: center;
-		gap: 0.55rem;
-		padding: 0.7rem 0.8rem;
-		border-radius: 14px;
-		background: rgba(255, 255, 255, 0.04);
-	}
-
-	.terrain-segmented input[type='radio'] {
-		margin: 0;
-		accent-color: #dfff2a;
-	}
-
-	.terrain-slider {
-		width: 100%;
-		margin-top: 0.8rem;
-		accent-color: #dfff2a;
-	}
-
-	.terrain-status {
-		margin: 0.85rem 0 0;
-		color: #9ca8b6;
-		font-size: 0.82rem;
-		line-height: 1.45;
-	}
-
-	.route-chooser {
-		position: absolute;
-		z-index: 4;
-		width: min(320px, calc(100vw - 2rem));
-		padding: 0.9rem;
-		border: 1px solid rgba(255, 255, 255, 0.1);
-		border-radius: 18px;
-		background: rgba(18, 24, 32, 0.94);
-		backdrop-filter: blur(12px);
-		box-shadow: 0 20px 42px rgba(0, 0, 0, 0.34);
-		color: #eef1f3;
-	}
-
-	.route-chooser-header {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 0.8rem;
-	}
-
-	.route-chooser-header h3 {
-		margin: 0;
-		font-size: 1rem;
-	}
-
-	.route-chooser-close {
-		width: 1.9rem;
-		height: 1.9rem;
-		border: none;
-		border-radius: 999px;
-		background: rgba(255, 255, 255, 0.08);
-		color: #eef1f3;
-		font-size: 1.1rem;
-		cursor: pointer;
-	}
-
-	.route-chooser-note {
-		margin: 0.55rem 0 0.85rem;
-		color: #aeb6c1;
-		font-size: 0.9rem;
-		line-height: 1.4;
-	}
-
-	.route-choice-list {
-		display: grid;
-		gap: 0.6rem;
-	}
-
-	.route-choice {
-		display: flex;
-		gap: 0.8rem;
-		align-items: flex-start;
-		width: 100%;
-		padding: 0.8rem 0.85rem;
-		border: 1px solid rgba(255, 255, 255, 0.08);
-		border-radius: 14px;
-		background: rgba(255, 255, 255, 0.04);
-		color: inherit;
-		text-align: left;
-		cursor: pointer;
-		transition:
-			border-color 120ms ease,
-			background 120ms ease,
-			transform 120ms ease;
-	}
-
-	.route-choice:hover {
-		border-color: rgba(223, 255, 42, 0.55);
-		background: rgba(223, 255, 42, 0.08);
-		transform: translateY(-1px);
-	}
-
-	.route-choice.preview {
-		border-color: rgba(223, 255, 42, 0.55);
-		background: rgba(223, 255, 42, 0.08);
-		transform: translateY(-1px);
-	}
-
-	.route-choice p {
-		margin: 0.18rem 0 0;
-		color: #9ca8b6;
-		font-size: 0.86rem;
-	}
-
-	.route-tag {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		min-width: 2.25rem;
-		padding: 0.15rem 0.45rem;
-		border: 2px solid #ffb000;
-		background: #fffaf0;
-		color: #262626;
-		font-size: 0.78rem;
-		font-weight: 700;
-		line-height: 1.1;
-	}
-
-	.trail-panel {
-		position: absolute;
-		top: 1rem;
-		left: 1rem;
-		bottom: 1rem;
-		width: min(420px, calc(100vw - 2rem));
-		overflow: auto;
-		padding: 1.25rem 1.25rem 1.5rem;
-		border: 1px solid rgba(255, 255, 255, 0.08);
-		border-radius: 22px;
-		background: rgba(17, 22, 30, 0.9);
-		backdrop-filter: blur(12px);
-		box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
-		color: #eef1f3;
-		font-family:
-			'ui-sans-serif',
-			'system-ui',
-			sans-serif;
-	}
-
-	.close {
-		position: sticky;
-		top: 0;
-		float: right;
-		width: 2rem;
-		height: 2rem;
-		border: none;
-		border-radius: 999px;
-		background: rgba(255, 255, 255, 0.08);
-		color: #eef1f3;
-		font-size: 1.2rem;
-		cursor: pointer;
-	}
-
-	.error {
-		margin-top: 2.75rem;
-		color: #ffb4ab;
-	}
-
-	.breadcrumb {
-		margin: 2.75rem 0 0.75rem;
-		font-size: 0.82rem;
-		letter-spacing: 0.04em;
-		text-transform: uppercase;
-		color: #97a2b0;
-	}
-
-	.hero h2 {
-		margin: 0;
-		font-size: clamp(1.7rem, 4vw, 2.5rem);
-		line-height: 1.05;
-	}
-
-	.eyebrow {
-		margin: 0 0 0.6rem;
-		font-size: 0.96rem;
-		font-weight: 700;
-		color: #ffd54f;
-	}
-
-	.eyebrow span {
-		color: #aeb6c1;
-		font-weight: 500;
-	}
-
-	.summary {
-		margin: 0.8rem 0 0;
-		color: #cfd6de;
-		line-height: 1.55;
-	}
-
-	.stats {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: 0.85rem;
-		margin-top: 1.35rem;
-	}
-
-	.stats div {
-		padding: 0.95rem 1rem;
-		border-radius: 16px;
-		background: rgba(255, 255, 255, 0.05);
-	}
-
-	.stats span {
-		display: block;
-		margin-bottom: 0.35rem;
-		font-size: 0.82rem;
-		color: #9ca8b6;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-	}
-
-	.stats strong {
-		font-size: 1.05rem;
-	}
-
-	.section {
-		margin-top: 1.45rem;
-	}
-
-	.section h3 {
-		margin: 0 0 0.75rem;
-		font-size: 1rem;
-	}
-
-	.meta-grid {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: 0.75rem;
-	}
-
-	.meta-card {
-		padding: 0.95rem 1rem;
-		border-radius: 16px;
-		background: rgba(255, 255, 255, 0.05);
-	}
-
-	.meta-card-wide {
-		grid-column: 1 / -1;
-	}
-
-	.meta-card span {
-		display: block;
-		margin-bottom: 0.38rem;
-		font-size: 0.8rem;
-		color: #9ca8b6;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-	}
-
-	.meta-card strong {
-		display: block;
-		font-size: 1rem;
-		line-height: 1.3;
-	}
-
-	.meta-card p {
-		margin: 0.18rem 0 0;
-		color: #9ca8b6;
-		font-size: 0.88rem;
-		line-height: 1.45;
-	}
-
-	.meta-link {
-		color: #dfff2a;
-		word-break: break-word;
-		text-decoration: none;
-	}
-
-	.meta-link:hover {
-		text-decoration: underline;
-	}
-
-	.profile-shell {
-		display: grid;
-		gap: 0.9rem;
-	}
-
-	.profile-chart {
-		padding: 0.7rem 0.7rem 0.35rem;
-		border-radius: 18px;
-		background:
-			linear-gradient(180deg, rgba(223, 255, 42, 0.05), rgba(255, 255, 255, 0.02)),
-			rgba(255, 255, 255, 0.05);
-	}
-
-	.profile-chart svg {
-		display: block;
-		width: 100%;
-		height: auto;
-		overflow: visible;
-	}
-
-	.profile-axis {
-		stroke: rgba(255, 255, 255, 0.14);
-		stroke-width: 1;
-	}
-
-	.profile-grid {
-		stroke: rgba(255, 255, 255, 0.08);
-		stroke-width: 1;
-		stroke-dasharray: 3 4;
-	}
-
-	.profile-area {
-		fill: url(#elevation-fill);
-	}
-
-	.profile-line {
-		fill: none;
-		stroke: #dfff2a;
-		stroke-width: 2.5;
-		stroke-linejoin: round;
-		stroke-linecap: round;
-	}
-
-	.profile-label {
-		fill: #9ca8b6;
-		font-size: 10px;
-		font-family: ui-sans-serif, system-ui, sans-serif;
-	}
-
-	.profile-meta-grid {
-		grid-template-columns: repeat(4, minmax(0, 1fr));
-	}
-
-	.download-section {
-		padding: 0.2rem 0 0;
-	}
-
-	.section-toggle {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		width: 100%;
-		padding: 0;
-		border: none;
-		background: transparent;
-		color: inherit;
-		cursor: pointer;
-		text-align: left;
-	}
-
-	.section-title {
-		margin-bottom: 0;
-		font-size: 1rem;
-		font-weight: 700;
-	}
-
-	.section-toggle span {
-		color: #dfff2a;
-		font-size: 1.1rem;
-		transition: transform 120ms ease;
-	}
-
-	.section-toggle span.open {
-		transform: rotate(180deg);
-	}
-
-	.download-fieldset {
-		margin-top: 0.9rem;
-		padding: 0.95rem 1rem;
-		border-radius: 16px;
-		background: rgba(255, 255, 255, 0.05);
-	}
-
-	.fieldset-label {
-		display: block;
-		margin-bottom: 0.7rem;
-		font-size: 0.82rem;
-		letter-spacing: 0.04em;
-		text-transform: uppercase;
-		color: #9ca8b6;
-	}
-
-	.radio-list {
-		display: grid;
-		gap: 0.65rem;
-	}
-
-	.format-list {
-		grid-template-columns: repeat(3, minmax(0, 1fr));
-	}
-
-	.format-list label,
-	.direction-list label {
-		display: flex;
-		gap: 0.7rem;
-		align-items: flex-start;
-		padding: 0.75rem 0.8rem;
-		border-radius: 14px;
-		background: rgba(255, 255, 255, 0.04);
-	}
-
-	.format-list label {
-		align-items: center;
-	}
-
-	.radio-list input {
-		margin: 0.15rem 0 0;
-		accent-color: #dfff2a;
-	}
-
-	.direction-list strong {
-		display: block;
-		font-size: 0.96rem;
-	}
-
-	.direction-list p {
-		margin: 0.2rem 0 0;
-		color: #9ca8b6;
-		font-size: 0.86rem;
-		line-height: 1.35;
-	}
-
-	.download-button {
-		width: 100%;
-		margin-top: 0.95rem;
-		padding: 0.92rem 1rem;
-		border: none;
-		border-radius: 16px;
-		background: #dfff2a;
-		color: #11161e;
-		font-size: 1rem;
-		font-weight: 800;
-		cursor: pointer;
-		transition:
-			transform 120ms ease,
-			filter 120ms ease;
-	}
-
-	.download-button:hover:not(:disabled) {
-		transform: translateY(-1px);
-		filter: brightness(1.03);
-	}
-
-	.download-button:disabled {
-		cursor: progress;
-		opacity: 0.72;
-	}
-
-	.download-error {
-		margin: 0.7rem 0 0;
-		color: #ffb4ab;
-		font-size: 0.9rem;
-	}
-
-	.analysis-note {
-		margin: 0 0 0.8rem;
-		color: #aeb6c1;
-		font-size: 0.9rem;
-		line-height: 1.45;
-	}
-
-	.chips {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.5rem;
-	}
-
-	.chip {
-		padding: 0.45rem 0.8rem;
-		border-radius: 999px;
-		background: rgba(255, 255, 255, 0.08);
-		color: #dfe5eb;
-		font-size: 0.9rem;
-	}
-
-	.surface-bar {
-		display: flex;
-		height: 0.9rem;
-		overflow: hidden;
-		border-radius: 999px;
-		background: rgba(255, 255, 255, 0.08);
-	}
-
-	.surface-segment:first-child {
-		border-top-left-radius: 999px;
-		border-bottom-left-radius: 999px;
-	}
-
-	.surface-segment:last-child {
-		border-top-right-radius: 999px;
-		border-bottom-right-radius: 999px;
-	}
-
-	.surface-list {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: 0.75rem;
-		margin-top: 0.9rem;
-	}
-
-	.surface-item,
-	.analysis-item {
-		display: flex;
-		gap: 0.75rem;
-		align-items: flex-start;
-		padding: 0.9rem 0.95rem;
-		border-radius: 14px;
-		background: rgba(255, 255, 255, 0.05);
-	}
-
-	.surface-item p,
-	.analysis-item p {
-		margin: 0.16rem 0 0;
-		color: #9ca8b6;
-		font-size: 0.88rem;
-	}
-
-	.dot {
-		display: inline-block;
-		width: 0.9rem;
-		height: 0.9rem;
-		margin-top: 0.18rem;
-		border-radius: 999px;
-		flex: 0 0 auto;
-	}
-
-	.analysis-list {
-		display: grid;
-		gap: 0.7rem;
-	}
-
-	.count-pill {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		min-width: 1.3rem;
-		height: 1.3rem;
-		margin-left: 0.45rem;
-		padding: 0 0.38rem;
-		border-radius: 999px;
-		background: rgba(239, 68, 68, 0.16);
-		color: #ffd3d3;
-		font-size: 0.78rem;
-		font-weight: 700;
-		vertical-align: middle;
-	}
-
-	.start-dot {
-		background: #22c55e;
-	}
-
-	.end-dot,
-	.warning-dot {
-		background: #ef4444;
-	}
-
-	.branch-dot {
-		background: #67e8f9;
-	}
-
-	.disconnected-dot {
-		background: #9ca3af;
-	}
-
-	@media (max-width: 740px) {
-		.terrain-dock {
-			top: 0.75rem;
-			right: 0.75rem;
-			left: 0.75rem;
-			align-items: stretch;
-		}
-
-		.terrain-card {
-			width: 100%;
-		}
-
-		.trail-panel {
-			top: auto;
-			right: 0.75rem;
-			left: 0.75rem;
-			bottom: 0.75rem;
-			width: auto;
-			max-height: 58vh;
-		}
-
-		.stats,
-		.meta-grid,
-		.profile-meta-grid,
-		.surface-list,
-		.format-list {
-			grid-template-columns: 1fr;
-		}
-	}
-</style>

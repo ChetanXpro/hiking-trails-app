@@ -27,7 +27,7 @@ pub struct Region {
     pub osm_relation_id: Option<i64>,
     pub name: String,
     pub admin_level: Option<i16>,
-    pub country_code: String,
+    pub country_code: Option<String>,
     pub parent_region_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -50,6 +50,12 @@ pub struct Trail {
     pub default_direction_mode: String,
     pub direction_source: Option<String>,
     pub source_kind: String,
+    pub original_mapper_name: Option<String>,
+    pub original_mapper_provider: Option<String>,
+    pub original_mapper_user_id: Option<String>,
+    pub original_mapper_profile_url: Option<String>,
+    pub original_mapped_at: Option<DateTime<Utc>>,
+    pub original_mapper_source: Option<String>,
     pub last_synced_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -131,7 +137,9 @@ pub async fn fetch_trail_with_geometry(
         SELECT id, osm_relation_id, region_id, name, network, difficulty,
                distance_m, ascent_m, descent_m, summary, hike_type,
                estimated_duration_min, default_direction_mode, direction_source,
-               source_kind, last_synced_at,
+               source_kind, original_mapper_name, original_mapper_provider,
+               original_mapper_user_id, original_mapper_profile_url,
+               original_mapped_at, original_mapper_source, last_synced_at,
                created_at, updated_at,
                ST_AsBinary(geom) AS geom_wkb
         FROM trails
@@ -158,6 +166,12 @@ pub async fn fetch_trail_with_geometry(
         default_direction_mode: row.try_get("default_direction_mode")?,
         direction_source: row.try_get("direction_source")?,
         source_kind: row.try_get("source_kind")?,
+        original_mapper_name: row.try_get("original_mapper_name")?,
+        original_mapper_provider: row.try_get("original_mapper_provider")?,
+        original_mapper_user_id: row.try_get("original_mapper_user_id")?,
+        original_mapper_profile_url: row.try_get("original_mapper_profile_url")?,
+        original_mapped_at: row.try_get("original_mapped_at")?,
+        original_mapper_source: row.try_get("original_mapper_source")?,
         last_synced_at: row.try_get("last_synced_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -167,4 +181,26 @@ pub async fn fetch_trail_with_geometry(
     let geom = geom_bytes.map(|b| decode_wkb(&b)).transpose()?;
 
     Ok((trail, geom))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_deserializes_a_missing_country_code() {
+        let region: Region = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(),
+            "osm_relation_id": null,
+            "name": "Unknown region",
+            "admin_level": null,
+            "country_code": null,
+            "parent_region_id": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("deserialize nullable country code");
+
+        assert_eq!(region.country_code, None);
+    }
 }

@@ -1,0 +1,18 @@
+# `rsa` is locked only through SQLx's optional MySQL driver. This workspace
+# disables SQLx default features and enables PostgreSQL only; `cargo tree -i
+# rsa` is empty for every production binary. Keep this narrow exception until
+# SQLx no longer records the unfixed optional dependency, and remove it
+# immediately if a MySQL feature is ever enabled.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
+informational_warnings = ["unmaintained"]
+
+[output]
+deny = ["unmaintained"]
+format = "terminal"
+quiet = false
+show_tree = true
+
+[yanked]
+enabled = true
+update_index = true

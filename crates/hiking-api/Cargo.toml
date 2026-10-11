@@ -9,6 +9,7 @@ actix-web = "4"
 sqlx = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

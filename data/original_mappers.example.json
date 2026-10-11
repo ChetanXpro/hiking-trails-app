@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "relations": [
+    {
+      "osm_relation_id": 123456,
+      "osm_relation_version": 1,
+      "display_name": "Example OSM mapper",
+      "provider_user_id": "12345",
+      "profile_url": "https://www.openstreetmap.org/user/Example%20OSM%20mapper",
+      "mapped_at": "2024-01-15T10:30:00Z"
+    }
+  ]
+}

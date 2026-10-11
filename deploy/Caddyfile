@@ -1,0 +1,83 @@
+{
+	admin off
+	servers {
+		# Docker's private network proxy is trusted. Do not trust arbitrary
+		# internet X-Forwarded-For headers at an exposed origin.
+		trusted_proxies static private_ranges
+	}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Transport failures do not produce an upstream response, so the tile
+	# handle_response matcher below cannot see them. Ensure generated proxy errors
+	# are never cached by browsers or Cloudflare.
+	handle_errors {
+		header Cache-Control "no-store"
+		respond "Service unavailable" 503
+	}
+
+	log {
+		output stdout
+		format json
+	}
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(self)"
+		Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data: https:; connect-src 'self' https:; worker-src 'self' blob:"
+	}
+
+	# Readiness includes database state and is for the private Docker network only.
+	# Return a cache-proof 404 instead of proxying it from the public origin.
+	@public_ready path /api/ready /api/ready/*
+	handle @public_ready {
+		header Cache-Control "no-store"
+		respond "Not found" 404
+	}
+
+	@api path /api /api/*
+	handle @api {
+		uri strip_prefix /api
+		reverse_proxy api:8080 {
+			health_uri /ready
+			health_interval 30s
+			health_timeout 3s
+			lb_try_duration 3s
+		}
+	}
+
+	@tiles {
+		path /trail_lines /trail_lines/* /trail_start_points /trail_start_points/* /trail_end_points /trail_end_points/* /outdoor_waypoints /outdoor_waypoints/* /terrain_rgb /terrain_rgb/* /terrain_rgb_hma /terrain_rgb_hma/*
+	}
+	handle @tiles {
+		# Tile URLs include a data release token. Keep the fallback TTL modest so a
+		# missed purge cannot leave an unversioned response stale for days.
+		header Cache-Control "public, max-age=300, s-maxage=3600, stale-while-revalidate=600"
+		reverse_proxy martin:3000 {
+			health_uri /health
+			health_interval 30s
+			health_timeout 3s
+			lb_try_duration 3s
+			@tile_error status 4xx 5xx
+			handle_response @tile_error {
+				header Cache-Control "no-store"
+				copy_response
+			}
+		}
+	}
+
+	handle {
+		reverse_proxy web:3000 {
+			health_uri /
+			health_interval 30s
+			health_timeout 3s
+			lb_try_duration 3s
+		}
+	}
+}

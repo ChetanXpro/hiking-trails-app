@@ -1,0 +1,19 @@
+# hiking-data-manifest-v1
+# Columns are TAB separated:
+# group  sha256  bytes  destination  object_key
+#
+# Generate a real manifest; do not deploy this placeholder file:
+# ./scripts/generate_data_manifest.sh --source-dir ./data \
+#   --output ./deploy/data-manifest.tsv \
+#   --asset runtime terrain_rgb_hma.mbtiles releases/hp-20260713-a1/terrain_rgb_hma.mbtiles \
+#   --asset runtime bootstrap/hiking-data.dump releases/hp-20260713-a1/hiking-data.dump \
+#   --asset import imports/hp.osm.pbf releases/hp-20260713-a1/hp.osm.pbf \
+#   --asset import imports/hma_fused.tif releases/hp-20260713-a1/hma_fused.tif \
+#   --asset import imports/worldcover_himachal.tif releases/hp-20260713-a1/worldcover_himachal.tif \
+#   --asset import imports/original_mappers.json releases/hp-20260713-a1/original_mappers.json
+runtime	REPLACE_WITH_SHA256	REPLACE_WITH_BYTES	terrain_rgb_hma.mbtiles	releases/hp-20260713-a1/terrain_rgb_hma.mbtiles
+runtime	REPLACE_WITH_SHA256	REPLACE_WITH_BYTES	bootstrap/hiking-data.dump	releases/hp-20260713-a1/hiking-data.dump
+import	REPLACE_WITH_SHA256	REPLACE_WITH_BYTES	imports/hp.osm.pbf	releases/hp-20260713-a1/hp.osm.pbf
+import	REPLACE_WITH_SHA256	REPLACE_WITH_BYTES	imports/hma_fused.tif	releases/hp-20260713-a1/hma_fused.tif
+import	REPLACE_WITH_SHA256	REPLACE_WITH_BYTES	imports/worldcover_himachal.tif	releases/hp-20260713-a1/worldcover_himachal.tif
+import	REPLACE_WITH_SHA256	REPLACE_WITH_BYTES	imports/original_mappers.json	releases/hp-20260713-a1/original_mappers.json

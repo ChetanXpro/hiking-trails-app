@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.96.0-bookworm AS build
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN --mount=type=cache,id=hiking-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=hiking-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=hiking-import-target,target=/app/target \
+    cargo build --locked --release -p hiking-import && \
+    install -Dm755 target/release/hiking-import /out/hiking-import
+
+# Debian 13 carries GDAL >=3.10, which lets the importer use batched point
+# sampling instead of spawning one gdallocationinfo process per sample.
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends \
+      ca-certificates gdal-bin osm2pgsql osmium-tool postgresql-client && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 10001 app && \
+    useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
+
+COPY --from=build /out/hiking-import /usr/local/bin/hiking-import
+COPY osm2pgsql /app/osm2pgsql
+COPY deploy/sql /app/deploy/sql
+COPY --chmod=755 deploy/importer-entrypoint.sh /usr/local/bin/importer-entrypoint
+WORKDIR /app
+
+# One-shot tools run without a home directory. Keep GDAL/libpq scratch state in
+# the bounded, noexec /tmp mount supplied by Compose.
+ENV HOME=/tmp \
+    CPL_TMPDIR=/tmp
+
+# This image is intentionally only used by one-shot import-profile jobs. It is
+# not part of the runtime stack and can be removed after an import.
+USER app
+ENTRYPOINT []
+CMD ["hiking-import"]

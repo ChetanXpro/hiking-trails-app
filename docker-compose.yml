@@ -14,7 +14,7 @@ services:
       retries: 5
 
   martin:
-    image: ghcr.io/maplibre/martin:latest
+    image: ghcr.io/maplibre/martin:1.11.0@sha256:0650e9025f5fcffdc686358114679421b5e6b0ca37b374ad8a66f14709d59d2b
     depends_on:
       db:
         condition: service_healthy
@@ -22,16 +22,19 @@ services:
       - "3000:3000"
     env_file:
       - .env
+    environment:
+      # Override the host-oriented URL from .env with Docker's private DB host.
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-hiking}
+      MARTIN_TILE_ARCHIVES: terrain_rgb.mbtiles terrain_rgb_hma.mbtiles
     volumes:
-      # Local MBTiles/PMTiles files for Martin autodiscovery, including terrain_rgb.mbtiles.
-      - ./data:/data
+      - ./data:/data:ro
+      - ./deploy/martin-entrypoint.sh:/usr/local/bin/hiking-martin-entrypoint:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/hiking-martin-entrypoint"]
     command:
-      # Martin only loads file-backed sources when the directory/file path
-      # is passed as a startup connection argument.
-      - /data
-      # Keep PostGIS as an explicit startup connection too, instead of
-      # relying on implicit env-based discovery.
-      - postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-hiking}
+      - --cache-size
+      - ${MARTIN_CACHE_SIZE_MB:-96}
+      - --pool-size
+      - ${MARTIN_DB_POOL_SIZE:-8}
 
   # Kafka, Redis, or anything else purely infra goes here later --
   # same pattern: image + env_file: .env + a volume if it's stateful.

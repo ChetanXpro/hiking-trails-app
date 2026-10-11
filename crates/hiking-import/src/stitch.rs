@@ -26,16 +26,20 @@ impl NodeAssigner {
     }
 
     fn bucket_key(coord: (f64, f64)) -> (i32, i32) {
-        let cell_size_deg = SNAP_TOLERANCE_METERS / 111_320.0;
+        let lat_rad = coord.1.to_radians();
+        let cell_size_deg_lat = SNAP_TOLERANCE_METERS / 111_320.0;
+        let cell_size_deg_lon = SNAP_TOLERANCE_METERS / (111_320.0 * lat_rad.cos().max(0.01));
         (
-            (coord.0 / cell_size_deg).floor() as i32,
-            (coord.1 / cell_size_deg).floor() as i32,
+            (coord.0 / cell_size_deg_lon).floor() as i32,
+            (coord.1 / cell_size_deg_lat).floor() as i32,
         )
     }
 
     fn node_id_for(&mut self, coord: (f64, f64)) -> usize {
         let (bucket_x, bucket_y) = Self::bucket_key(coord);
-        for neighbor_x in (bucket_x - 1)..=(bucket_x + 1) {
+        let lat_rad = coord.1.to_radians();
+        let lon_reach = (1.0 / lat_rad.cos().max(0.01)).ceil() as i32;
+        for neighbor_x in (bucket_x - lon_reach)..=(bucket_x + lon_reach) {
             for neighbor_y in (bucket_y - 1)..=(bucket_y + 1) {
                 if let Some(candidate_ids) = self.buckets.get(&(neighbor_x, neighbor_y)) {
                     for &id in candidate_ids {
@@ -148,11 +152,9 @@ fn walk_component(
     let mut previous_member_index: Option<usize> = None;
     let mut order_penalty = 0usize;
     let mut role_mismatches = 0usize;
+    let mut encountered_branch = false;
 
-    loop {
-        let Some(candidates) = adjacency.get(&current) else {
-            break;
-        };
+    while let Some(candidates) = adjacency.get(&current) {
         let mut candidate_edges = candidates
             .iter()
             .copied()
@@ -205,10 +207,14 @@ fn walk_component(
         current = if a == current { b } else { a };
 
         if degree.get(&current).copied().unwrap_or(0) >= 3 {
-            warnings.push(
-                "branch point at a shared node -- this route has a junction, not a simple path; took the first available continuation rather than guessing the intended branch".to_string()
-            );
+            encountered_branch = true;
         }
+    }
+
+    if encountered_branch {
+        warnings.push(
+            "branch point at a shared node -- this route has a junction, not a simple path; took the first available continuation rather than guessing the intended branch".to_string()
+        );
     }
 
     let stranded = adjacency
@@ -317,7 +323,15 @@ pub fn stitch_ways(ways: &[WayRecord], had_direction_roles: bool) -> StitchResul
 
     let (main_root, main_component) = components
         .iter()
-        .max_by_key(|(_, edges)| edges.len())
+        .max_by_key(|(_, component)| {
+            // Stable ties keep the same route geometry across repeated imports.
+            let first_member = component
+                .iter()
+                .map(|&i| ways[edges[i].2].member_index)
+                .min()
+                .unwrap_or(usize::MAX);
+            (component.len(), std::cmp::Reverse(first_member))
+        })
         .map(|(&root, edges)| (root, edges.clone()))
         .unwrap_or((0, Vec::new()));
 
@@ -475,7 +489,7 @@ pub fn stitch_ways(ways: &[WayRecord], had_direction_roles: bool) -> StitchResul
 
     let has_explicit_direction_role = ways
         .iter()
-        .any(|way| matches!(preferred_reversed(&way.role), Some(_)));
+        .any(|way| preferred_reversed(&way.role).is_some());
     let direction_source = if had_direction_roles || has_explicit_direction_role {
         "member_role"
     } else if hike_type == "loop" || ways.len() > 1 {

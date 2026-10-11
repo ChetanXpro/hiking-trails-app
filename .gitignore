@@ -7,6 +7,9 @@
 .env
 .env.local
 .env.*.local
+.env.production
+.env.production.*
+!.env.production.example
 
 # Rust build output
 /target/
@@ -53,8 +56,14 @@ yarn-error.log*
 /data/*
 !/data/.gitkeep
 !/data/README.md
+!/data/original_mappers.example.json
 
 # Common local raster / terrain working dirs
 /data/dem_tiles/
 /data/worldcover/
 /data/fabdem/
+
+# Generated immutable release manifests (keep only the documented template)
+/deploy/data-manifest.tsv
+/deploy/data-manifest.*.tsv
+!/deploy/data-manifest.example.tsv

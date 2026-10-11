@@ -1,0 +1,399 @@
+name: ${COMPOSE_PROJECT_NAME:-hiking}
+
+x-runtime-defaults: &runtime-defaults
+  platform: ${DEPLOY_PLATFORM:?Set DEPLOY_PLATFORM to linux/amd64 or linux/arm64}
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-job-defaults: &job-defaults
+  platform: ${DEPLOY_PLATFORM:?Set DEPLOY_PLATFORM to linux/amd64 or linux/arm64}
+  init: true
+  restart: "no"
+  user: "${DEPLOY_UID:-1000}:${DEPLOY_GID:-1000}"
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=128m,noexec,nosuid,nodev
+  pids_limit: 128
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-import-environment: &import-environment
+  HOME: /tmp
+  TMPDIR: /tmp
+  PGHOST: db
+  PGPORT: "5432"
+  PGDATABASE: ${POSTGRES_DB:-hiking}
+  PGUSER: hiking_import
+  PGPASSWORD: ${IMPORT_DB_PASSWORD:?Set IMPORT_DB_PASSWORD in .env.production}
+  DATABASE_URL: postgresql://hiking_import:${IMPORT_DB_PASSWORD:?Set IMPORT_DB_PASSWORD}@db:5432/${POSTGRES_DB:-hiking}
+
+services:
+  db:
+    <<: *runtime-defaults
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.postgis
+      platforms:
+        - ${DEPLOY_PLATFORM:?Set DEPLOY_PLATFORM to linux/amd64 or linux/arm64}
+    image: ${IMAGE_PREFIX:-hiking}/postgis:${POSTGIS_IMAGE_VERSION:-pg16.14-postgis3.6.4-r1}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hiking}
+      POSTGRES_USER: ${POSTGRES_USER:-hiking_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+      API_DB_PASSWORD: ${API_DB_PASSWORD:?Set API_DB_PASSWORD in .env.production}
+      IMPORT_DB_PASSWORD: ${IMPORT_DB_PASSWORD:?Set IMPORT_DB_PASSWORD in .env.production}
+      MARTIN_DB_PASSWORD: ${MARTIN_DB_PASSWORD:?Set MARTIN_DB_PASSWORD in .env.production}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${DB_SHARED_BUFFERS:-128MB}
+      - -c
+      - effective_cache_size=${DB_EFFECTIVE_CACHE_SIZE:-512MB}
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=${DB_MAX_CONNECTIONS:-40}
+      - -c
+      - jit=off
+    shm_size: 256mb
+    volumes:
+      - hiking_pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    expose:
+      - "5432"
+    healthcheck:
+      # TCP avoids a false healthy signal from entrypoint's socket-only
+      # temporary server while init scripts are still creating roles.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    mem_limit: ${DB_MEMORY_LIMIT:-640m}
+    pids_limit: 256
+    stop_grace_period: 60s
+    networks:
+      - backend
+
+  migrate:
+    <<: *job-defaults
+    profiles: ["tools", "import"]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.migrate
+      platforms:
+        - ${DEPLOY_PLATFORM:?Set DEPLOY_PLATFORM to linux/amd64 or linux/arm64}
+    image: ${IMAGE_PREFIX:-hiking}/migrate:${APP_VERSION:-local}
+    environment:
+      <<: *import-environment
+      MIGRATIONS_DIR: /app/migrations
+      DB_STATEMENT_TIMEOUT_MS: "0"
+      DB_LOCK_TIMEOUT_MS: "30000"
+      DB_POOL_MIN_CONNECTIONS: "1"
+      DB_POOL_MAX_CONNECTIONS: "2"
+      DB_APPLICATION_NAME: hiking-migrate
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: ${MIGRATE_MEMORY_LIMIT:-192m}
+    networks:
+      - backend
+
+  restore:
+    <<: *job-defaults
+    profiles: ["tools"]
+    image: ${IMAGE_PREFIX:-hiking}/postgis:${POSTGIS_IMAGE_VERSION:-pg16.14-postgis3.6.4-r1}
+    environment:
+      <<: *import-environment
+      RESTORE_DUMP: ${RESTORE_DUMP:-bootstrap/hiking-data.dump}
+    entrypoint: ["/bin/sh", "/usr/local/bin/restore-data"]
+    volumes:
+      - ${DATA_DIR:-./data}:/data:ro
+      - ./deploy/restore-data.sh:/usr/local/bin/restore-data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: ${RESTORE_MEMORY_LIMIT:-256m}
+    networks:
+      - backend
+
+  osm-import:
+    <<: *job-defaults
+    profiles: ["import"]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.tools
+      platforms:
+        - ${DEPLOY_PLATFORM:?Set DEPLOY_PLATFORM to linux/amd64 or linux/arm64}
+    image: ${IMAGE_PREFIX:-hiking}/tools:${APP_VERSION:-local}
+    environment:
+      <<: *import-environment
+    command:
+      - osm2pgsql
+      - --host=db
+      - --port=5432
+      - --database=${POSTGRES_DB:-hiking}
+      - --username=hiking_import
+      - --cache=${OSM2PGSQL_CACHE_MB:-256}
+      - --slim
+      - --drop
+      - --output=flex
+      - --style=/app/osm2pgsql/trails.lua
+      - /data/${IMPORT_PBF:-imports/hp.osm.pbf}
+    volumes:
+      - ${DATA_DIR:-./data}:/data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: ${IMPORT_MEMORY_LIMIT:-768m}
+    networks:
+      - backend
+
+  importer:
+    <<: *job-defaults
+    profiles: ["import"]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.tools
+      platforms:
+        - ${DEPLOY_PLATFORM:?Set DEPLOY_PLATFORM to linux/amd64 or linux/arm64}
+    image: ${IMAGE_PREFIX:-hiking}/tools:${APP_VERSION:-local}
+    environment:
+      <<: *import-environment
+      RUST_LOG: ${RUST_LOG:-info}
+      DEM_PATH: ${DEM_PATH:-}
+      DEM_PATHS: ${DEM_PATHS:-}
+      WORLDCOVER_PATH: ${WORLDCOVER_PATH:-}
+      OSM_ORIGINAL_MAPPERS_PATH: ${OSM_ORIGINAL_MAPPERS_PATH:-}
+      ELEVATION_SAMPLE_SPACING_M: ${ELEVATION_SAMPLE_SPACING_M:-30}
+      ELEVATION_SMOOTHING_WINDOW_SAMPLES: ${ELEVATION_SMOOTHING_WINDOW_SAMPLES:-5}
+      ELEVATION_GAIN_LOSS_THRESHOLD_M: ${ELEVATION_GAIN_LOSS_THRESHOLD_M:-10}
+      ELEVATION_MAX_SAMPLES: ${ELEVATION_MAX_SAMPLES:-20000}
+      DEM_AUTO_DISCOVER: ${DEM_AUTO_DISCOVER:-false}
+      IMPORT_PRUNE_MISSING_TRAILS: ${IMPORT_PRUNE_MISSING_TRAILS:-false}
+      DB_STATEMENT_TIMEOUT_MS: "0"
+      DB_LOCK_TIMEOUT_MS: "30000"
+      DB_POOL_MIN_CONNECTIONS: "1"
+      DB_POOL_MAX_CONNECTIONS: "4"
+      DB_APPLICATION_NAME: hiking-import
+    command: ["/usr/local/bin/importer-entrypoint"]
+    volumes:
+      - ${DATA_DIR:-./data}:/data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: ${IMPORT_MEMORY_LIMIT:-768m}
+    networks:
+      - backend
+
+  cleanup-import:
+    <<: *job-defaults
+    profiles: ["import"]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.tools
+      platforms:
+        - ${DEPLOY_PLATFORM:?Set DEPLOY_PLATFORM to linux/amd64 or linux/arm64}
+    image: ${IMAGE_PREFIX:-hiking}/tools:${APP_VERSION:-local}
+    environment:
+      <<: *import-environment
+    command: ["psql", "--file", "/app/deploy/sql/drop_import_staging.sql"]
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: ${CLEANUP_MEMORY_LIMIT:-128m}
+    networks:
+      - backend
+
+  api:
+    <<: *runtime-defaults
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.api
+      platforms:
+        - ${DEPLOY_PLATFORM:?Set DEPLOY_PLATFORM to linux/amd64 or linux/arm64}
+    image: ${IMAGE_PREFIX:-hiking}/api:${APP_VERSION:-local}
+    environment:
+      DATABASE_URL: postgresql://hiking_api:${API_DB_PASSWORD:?Set API_DB_PASSWORD}@db:5432/${POSTGRES_DB:-hiking}
+      RUST_LOG: ${RUST_LOG:-info}
+      DB_POOL_MIN_CONNECTIONS: ${API_DB_POOL_MIN_CONNECTIONS:-1}
+      DB_POOL_MAX_CONNECTIONS: ${API_DB_POOL_MAX_CONNECTIONS:-10}
+      DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-10}
+      DB_ACQUIRE_TIMEOUT_SECONDS: ${DB_ACQUIRE_TIMEOUT_SECONDS:-5}
+      DB_IDLE_TIMEOUT_SECONDS: ${DB_IDLE_TIMEOUT_SECONDS:-600}
+      DB_MAX_LIFETIME_SECONDS: ${DB_MAX_LIFETIME_SECONDS:-1800}
+      DB_STATEMENT_TIMEOUT_MS: ${API_DB_STATEMENT_TIMEOUT_MS:-15000}
+      DB_LOCK_TIMEOUT_MS: ${API_DB_LOCK_TIMEOUT_MS:-3000}
+      DB_APPLICATION_NAME: hiking-api
+      API_BIND_ADDR: 0.0.0.0:8080
+      API_WORKERS: ${API_WORKERS:-2}
+      API_MAX_CONNECTIONS: ${API_MAX_CONNECTIONS:-32}
+      API_MAX_IN_FLIGHT_REQUESTS: ${API_MAX_IN_FLIGHT_REQUESTS:-32}
+      API_REQUEST_TIMEOUT_SECONDS: ${API_REQUEST_TIMEOUT_SECONDS:-30}
+      API_QUEUE_TIMEOUT_MS: ${API_QUEUE_TIMEOUT_MS:-2000}
+      API_READINESS_TIMEOUT_MS: ${API_READINESS_TIMEOUT_MS:-1000}
+      API_EXPORT_MAX_POINTS: ${API_EXPORT_MAX_POINTS:-25000}
+      API_EXPORT_MAX_BODY_BYTES: ${API_EXPORT_MAX_BODY_BYTES:-2097152}
+      API_KEEP_ALIVE_SECONDS: ${API_KEEP_ALIVE_SECONDS:-15}
+      API_CLIENT_REQUEST_TIMEOUT_SECONDS: ${API_CLIENT_REQUEST_TIMEOUT_SECONDS:-10}
+      API_CLIENT_DISCONNECT_TIMEOUT_SECONDS: ${API_CLIENT_DISCONNECT_TIMEOUT_SECONDS:-5}
+      API_SHUTDOWN_TIMEOUT_SECONDS: ${API_SHUTDOWN_TIMEOUT_SECONDS:-30}
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    mem_limit: ${API_MEMORY_LIMIT:-256m}
+    pids_limit: 256
+    stop_grace_period: ${API_STOP_GRACE_PERIOD_SECONDS:-45}s
+    networks:
+      - backend
+
+  martin:
+    <<: *runtime-defaults
+    image: ghcr.io/maplibre/martin:1.11.0@sha256:0650e9025f5fcffdc686358114679421b5e6b0ca37b374ad8a66f14709d59d2b
+    environment:
+      DATABASE_URL: postgresql://hiking_tiles:${MARTIN_DB_PASSWORD:?Set MARTIN_DB_PASSWORD}@db:5432/${POSTGRES_DB:-hiking}
+      RUST_LOG: martin=${MARTIN_LOG_LEVEL:-info}
+      MARTIN_TILE_ARCHIVES: ${MARTIN_TILE_ARCHIVES:-terrain_rgb_hma.mbtiles}
+    command:
+      - --cache-size
+      - ${MARTIN_CACHE_SIZE_MB:-96}
+      - --pool-size
+      - ${MARTIN_DB_POOL_SIZE:-8}
+    volumes:
+      - ${DATA_DIR:-./data}:/data:ro
+      - ./deploy/martin-entrypoint.sh:/usr/local/bin/hiking-martin-entrypoint:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/hiking-martin-entrypoint"]
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "3000"
+    # The pinned Martin image supplies its own HEALTHCHECK. Do not replace it
+    # with a shell utility that may not exist in the distroless runtime.
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    mem_limit: ${MARTIN_MEMORY_LIMIT:-384m}
+    pids_limit: 256
+    stop_grace_period: 30s
+    networks:
+      - backend
+
+  web:
+    <<: *runtime-defaults
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+      platforms:
+        - ${DEPLOY_PLATFORM:?Set DEPLOY_PLATFORM to linux/amd64 or linux/arm64}
+    image: ${IMAGE_PREFIX:-hiking}/web:${APP_VERSION:-local}
+    environment:
+      ORIGIN: ${APP_ORIGIN:?Set APP_ORIGIN in .env.production}
+      HOST: 0.0.0.0
+      PORT: "3000"
+      BODY_SIZE_LIMIT: 1M
+      SHUTDOWN_TIMEOUT: "10"
+      PUBLIC_BASEMAP_STYLE_URL: ${PUBLIC_BASEMAP_STYLE_URL:?Set PUBLIC_BASEMAP_STYLE_URL to your R2-hosted style}
+      PUBLIC_BASEMAP_LABEL_ANCHOR_ID: ${PUBLIC_BASEMAP_LABEL_ANCHOR_ID:-}
+      PUBLIC_MAP_GLYPHS_URL: ${PUBLIC_MAP_GLYPHS_URL:?Set PUBLIC_MAP_GLYPHS_URL to your R2-hosted glyphs}
+      PUBLIC_RASTER_TILE_URL: ${PUBLIC_RASTER_TILE_URL:-}
+      PUBLIC_RASTER_TILE_ATTRIBUTION: ${PUBLIC_RASTER_TILE_ATTRIBUTION:-}
+      PUBLIC_MARTIN_TRAILS_URL: ${PUBLIC_MARTIN_TRAILS_URL:-/trail_lines/{z}/{x}/{y}?v=${DATA_RELEASE:?Set DATA_RELEASE in .env.production}}
+      PUBLIC_MARTIN_OUTDOOR_WAYPOINTS_URL: ${PUBLIC_MARTIN_OUTDOOR_WAYPOINTS_URL:-/outdoor_waypoints/{z}/{x}/{y}?v=${DATA_RELEASE:?Set DATA_RELEASE in .env.production}}
+      PUBLIC_TERRAIN_RGB_URL: ${PUBLIC_TERRAIN_RGB_URL:-/terrain_rgb_hma/{z}/{x}/{y}?v=${DATA_RELEASE:?Set DATA_RELEASE in .env.production}}
+      PUBLIC_TERRAIN_RGB_ENCODING: ${PUBLIC_TERRAIN_RGB_ENCODING:-mapbox}
+      PUBLIC_TERRAIN_RGB_TILE_SIZE: ${PUBLIC_TERRAIN_RGB_TILE_SIZE:-512}
+      PUBLIC_TERRAIN_RGB_MAX_ZOOM: ${PUBLIC_TERRAIN_RGB_MAX_ZOOM:-13}
+      PUBLIC_TERRAIN_RGB_BOUNDS: ${PUBLIC_TERRAIN_RGB_BOUNDS:-}
+      PUBLIC_TERRAIN_ATTRIBUTION: ${PUBLIC_TERRAIN_ATTRIBUTION:-}
+      PUBLIC_WEATHER_API_URL: ${PUBLIC_WEATHER_API_URL:-}
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    mem_limit: ${WEB_MEMORY_LIMIT:-128m}
+    pids_limit: 128
+    stop_grace_period: 20s
+    networks:
+      - backend
+
+  gateway:
+    <<: *runtime-defaults
+    image: caddy:2.11.4-alpine
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env.production}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - hiking_caddy_data:/data
+      - hiking_caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      martin:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+      - /run:size=4m,nosuid,nodev
+    mem_limit: ${GATEWAY_MEMORY_LIMIT:-96m}
+    pids_limit: 128
+    stop_grace_period: 30s
+    networks:
+      - edge
+      - backend
+
+volumes:
+  hiking_pgdata:
+    name: ${PGDATA_VOLUME_NAME:?Set PGDATA_VOLUME_NAME in .env.production}
+  hiking_caddy_data:
+  hiking_caddy_config:
+
+networks:
+  edge:
+  backend:
+    internal: true
