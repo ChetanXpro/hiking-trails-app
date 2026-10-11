@@ -32,9 +32,9 @@ export function fitToTrailBounds(
 	map: maplibregl.Map | undefined,
 	trail: TrailDetail | null
 ) {
-	if (!map || !trail?.geometry?.coordinates) return;
+	if (!map || !trail || !Array.isArray(trail.geometry?.coordinates)) return;
 
-	const bounds = boundsForGeometry(trail.geometry.coordinates);
+	const bounds = boundsForGeometry(trail.geometry.coordinates as Array<[number, number]>);
 	if (!bounds) return;
 
 	const padding = { top: 60, bottom: 300, left: 20, right: 20 };
@@ -52,9 +52,9 @@ export function centerOnTrail(
 	trail: TrailDetail | null,
 	zoom?: number
 ) {
-	if (!map || !trail?.geometry?.coordinates) return;
+	if (!map || !trail || !Array.isArray(trail.geometry?.coordinates)) return;
 
-	const bounds = boundsForGeometry(trail.geometry.coordinates);
+	const bounds = boundsForGeometry(trail.geometry.coordinates as Array<[number, number]>);
 	if (!bounds) return;
 
 	const centerLng = (bounds.minLng + bounds.maxLng) / 2;
@@ -69,7 +69,7 @@ export function centerOnTrail(
 
 export function boundsForRouteChoice(
 	routeChoice: RouteChoice,
-	routeGeometry?: GeoJSON.Position[]
+	routeGeometry?: Array<[number, number]>
 ): { minLng: number; minLat: number; maxLng: number; maxLat: number } | null {
 	if (!routeGeometry) return null;
 	return boundsForGeometry(routeGeometry);
@@ -77,7 +77,7 @@ export function boundsForRouteChoice(
 
 export function fitToRouteChoice(
 	map: maplibregl.Map | undefined,
-	routeGeometry?: GeoJSON.Position[]
+	routeGeometry?: Array<[number, number]>
 ) {
 	if (!map || !routeGeometry) return;
 

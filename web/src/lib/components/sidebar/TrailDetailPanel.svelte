@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { TrailDetail, TrailSurface, TrailWaypoint, WeatherForecast } from '../../types';
+	import type { TrailDetail, TrailWaypoint, WeatherForecast } from '../../types';
 	import ElevationChart from '../../ElevationChart.svelte';
 	import WeatherSummary from '../../WeatherSummary.svelte';
 
@@ -11,12 +11,22 @@
 		shareMessage: string | null;
 		shareFallback: string | null;
 		downloadError: string | null;
-		elevationStatus: 'loading' | 'ready' | 'error' | 'unavailable';
+		elevationStatus: 'idle' | 'loading' | 'ready' | 'error' | 'missing';
 		elevationProfile: any | null;
 		weatherForecast: WeatherForecast | null;
-		weatherStatus: 'loading' | 'ready' | 'error';
+		weatherStatus: 'idle' | 'loading' | 'ready' | 'error';
 		weatherError: string | null;
 		qaMode?: boolean;
+		downloadSectionOpen: boolean;
+		downloadFormat: 'gpx' | 'kml' | 'geojson';
+		directionMode: 'forward' | 'backward' | 'both';
+		mapperProfileUrl: string | null;
+		directionLabel: (mode: 'forward' | 'backward' | 'both') => string;
+		formatFeatureLabel: (feature: string) => string;
+		formatSurfaceLabel: (surface: string) => string;
+		surfaceColor: (surface: string) => string;
+		formatDistance: (distance: number | null) => string;
+		warningSummaries: Array<{ key: string; title: string; description: string; count: number }>;
 		// Pre-formatted display strings from parent
 		difficultyLabel?: string;
 		hikeTypeLabel?: string;
@@ -28,6 +38,10 @@
 		onCenter?: () => void;
 		onShare?: () => void;
 		onExportGPX?: () => void;
+		onExport?: () => void;
+		onToggleDownload?: () => void;
+		onFormatChange?: (format: 'gpx' | 'kml' | 'geojson') => void;
+		onDirectionChange?: (direction: 'forward' | 'backward' | 'both') => void;
 		onReloadRoute?: () => void;
 		onShowWaypoint?: (waypoint: TrailWaypoint) => void;
 		onRefreshWeather?: (coordinates?: any) => void;
@@ -42,16 +56,36 @@
 		shareMessage = null,
 		shareFallback = null,
 		downloadError = null,
-		elevationStatus = 'unavailable',
+		elevationStatus = 'idle',
 		elevationProfile = null,
 		weatherForecast = null,
-		weatherStatus = 'loading',
+		weatherStatus = 'idle',
 		weatherError = null,
 		qaMode = false,
+		downloadSectionOpen,
+		downloadFormat,
+		directionMode,
+		mapperProfileUrl,
+		directionLabel,
+		formatFeatureLabel,
+		formatSurfaceLabel,
+		surfaceColor,
+		formatDistance,
+		warningSummaries,
+		difficultyLabel = 'Unrated',
+		hikeTypeLabel = 'Hike',
+		distanceLabel = '—',
+		ascentLabel = '—',
+		descentLabel = '—',
+		durationLabel = '—',
 		onClose,
 		onCenter,
 		onShare,
 		onExportGPX,
+		onExport,
+		onToggleDownload,
+		onFormatChange,
+		onDirectionChange,
 		onReloadRoute,
 		onShowWaypoint,
 		onRefreshWeather,
@@ -152,6 +186,7 @@
 				Distances follow the mapped route. Time estimates exclude breaks and changing trail conditions.
 			</p>
 		</section>
+		<p class="source-credit">Map data © OpenStreetMap contributors{#if selectedTrail.original_mapper_name}. Route first added by {#if mapperProfileUrl}<a href={mapperProfileUrl} target="_blank" rel="noreferrer">{selectedTrail.original_mapper_name}</a>{:else}{selectedTrail.original_mapper_name}{/if}{/if}. <a href={`https://www.openstreetmap.org/relation/${selectedTrail.osm_relation_id}`} target="_blank" rel="noreferrer">View source route ↗</a></p>
 
 		{#if selectedTrail.cautions?.length}
 			<section class="section">
@@ -213,7 +248,7 @@
 				<h3>What to expect</h3>
 				<div class="chips">
 					{#each selectedTrail.features as feature}
-						<span class="chip">{feature}</span>
+						<span class="chip">{formatFeatureLabel(feature)}</span>
 					{/each}
 				</div>
 			</section>
@@ -224,258 +259,59 @@
 				<h3>Surfaces</h3>
 				<div class="surface-bar">
 					{#each selectedTrail.surfaces as surface}
-						<div class="surface-segment" style={`width:${surface.pct}%;background: #888`}></div>
+						<div class="surface-segment" style={`width:${surface.pct}%;background:${surfaceColor(surface.surface_type)}`}></div>
 					{/each}
 				</div>
 				<div class="surface-list">
 					{#each selectedTrail.surfaces as surface}
 						<div class="surface-item">
-							<span class="dot" style="background: #888"></span>
+							<span class="dot" style={`background:${surfaceColor(surface.surface_type)}`}></span>
 							<div>
-								<strong>{surface.surface_type}</strong>
-								<p>{surface.pct.toFixed(0)}%</p>
+								<strong>{formatSurfaceLabel(surface.surface_type)}</strong>
+								<p>{surface.pct.toFixed(0)}% · {formatDistance(surface.distance_m)}</p>
 							</div>
 						</div>
 					{/each}
 				</div>
 			</section>
 		{/if}
+
+		<section class="section download-section">
+			<button class="section-toggle" type="button" aria-expanded={downloadSectionOpen} onclick={onToggleDownload}>
+				<span class="section-title">Download route</span><span class:open={downloadSectionOpen}>⌄</span>
+			</button>
+			{#if downloadSectionOpen}
+				<p class="analysis-note">Choose a format and travel direction. The map previews the selected direction.</p>
+				<div class="download-fieldset">
+					<span class="fieldset-label">Format</span>
+					<div class="radio-list format-list">
+						{#each ['gpx', 'kml', 'geojson'] as format}
+							<label><input type="radio" name="route-format" checked={downloadFormat === format} onchange={() => onFormatChange?.(format as 'gpx' | 'kml' | 'geojson')} /><span>{format === 'geojson' ? 'GeoJSON' : format.toUpperCase()}</span></label>
+						{/each}
+					</div>
+				</div>
+				<div class="download-fieldset">
+					<span class="fieldset-label">Travel direction</span>
+					<div class="radio-list direction-list">
+						{#each ['forward', 'backward', 'both'] as direction}
+							<label><input type="radio" name="route-direction" checked={directionMode === direction} onchange={() => onDirectionChange?.(direction as 'forward' | 'backward' | 'both')} /><div><strong>{direction === 'both' ? 'Both ways' : direction === 'forward' ? 'Forward' : 'Backward'}</strong><p>{directionLabel(direction as 'forward' | 'backward' | 'both')}</p></div></label>
+						{/each}
+					</div>
+				</div>
+				<button class="download-button" type="button" disabled={downloadBusy} onclick={onExport}>{downloadBusy ? 'Preparing file…' : 'Get file'}</button>
+			{/if}
+		</section>
+
+		{#if qaMode && (selectedTrail.stitch_diagnostics.length || warningSummaries.length)}
+			<section class="section">
+				<h3>Analyze relation</h3>
+				<p class="analysis-note">Review reconstruction warnings against the route markers on the map.</p>
+				<div class="analysis-list">
+					{#each warningSummaries as summary (summary.key)}
+						<div class="analysis-item warning-item"><span class="dot warning-dot"></span><div><strong>{summary.title}{summary.count > 1 ? ` (${summary.count})` : ''}</strong><p>{summary.description}</p></div></div>
+					{/each}
+				</div>
+			</section>
+		{/if}
 	{/if}
 </aside>
-
-<style>
-	.trail-panel {
-		position: absolute;
-		right: 0;
-		top: 0;
-		bottom: 0;
-		z-index: 10;
-		width: min(460px, 100vw);
-		background: rgba(250, 247, 238, 0.96);
-		border-left: 1px solid rgba(0, 0, 0, 0.08);
-		overflow: auto;
-		padding: 1rem;
-		display: flex;
-		flex-direction: column;
-		transform: translateX(100%);
-		transition: transform 200ms ease;
-	}
-
-	.trail-panel:not([hidden]) {
-		transform: translateX(0);
-	}
-
-	.close {
-		position: absolute;
-		top: 1rem;
-		right: 1rem;
-		width: 2rem;
-		height: 2rem;
-		border: none;
-		border-radius: 50%;
-		background: rgba(0, 0, 0, 0.05);
-		cursor: pointer;
-		font-size: 1.5rem;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		transition: all 0.2s ease;
-		color: #25302a;
-	}
-
-	.close:hover {
-		background: rgba(0, 0, 0, 0.1);
-	}
-
-	.breadcrumb {
-		margin: 0;
-		font-size: 0.8rem;
-		color: #6b5d4f;
-		text-transform: uppercase;
-		letter-spacing: 0.5px;
-		font-weight: 500;
-	}
-
-	.hero {
-		margin: 1rem 0;
-	}
-
-	.hero h2 {
-		margin: 0.5rem 0 0.25rem;
-		font-size: 1.5rem;
-		color: #25302a;
-	}
-
-	.hero .eyebrow {
-		margin: 0;
-		font-size: 0.85rem;
-		color: #2e6653;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.5px;
-	}
-
-	.hero .summary {
-		margin: 0.5rem 0 0;
-		font-size: 0.95rem;
-		color: #5d6961;
-		line-height: 1.5;
-	}
-
-	.stats {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 0.5rem;
-		margin: 1rem 0;
-	}
-
-	.stats div {
-		padding: 0.75rem;
-		background: rgba(46, 102, 83, 0.05);
-		border-radius: 6px;
-		display: flex;
-		flex-direction: column;
-		gap: 0.25rem;
-	}
-
-	.stats span {
-		font-size: 0.75rem;
-		font-weight: 600;
-		color: #6b5d4f;
-		text-transform: uppercase;
-	}
-
-	.stats strong {
-		font-size: 1.1rem;
-		color: #25302a;
-	}
-
-	.trail-quick-actions {
-		display: flex;
-		gap: 0.5rem;
-		margin: 1rem 0;
-	}
-
-	.trail-quick-actions button {
-		flex: 1;
-		padding: 0.75rem;
-		border: 1px solid rgba(0, 0, 0, 0.1);
-		border-radius: 6px;
-		background: white;
-		cursor: pointer;
-		font-weight: 600;
-		font-size: 0.85rem;
-		transition: all 0.2s ease;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 0.5rem;
-		color: #25302a;
-	}
-
-	.trail-quick-actions button:hover:not(:disabled) {
-		background: rgba(46, 102, 83, 0.1);
-		border-color: #2e6653;
-	}
-
-	.trail-quick-actions button:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
-	}
-
-	.section {
-		margin: 1.5rem 0;
-		padding: 0.75rem;
-		border-radius: 6px;
-		background: rgba(46, 102, 83, 0.03);
-		border: 1px solid rgba(46, 102, 83, 0.1);
-	}
-
-	.section h3 {
-		margin: 0 0 0.75rem;
-		font-size: 0.95rem;
-		font-weight: 700;
-		color: #25302a;
-	}
-
-	.chips {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.5rem;
-	}
-
-	.chip {
-		display: inline-block;
-		padding: 0.35rem 0.65rem;
-		background: rgba(46, 102, 83, 0.15);
-		border-radius: 999px;
-		font-size: 0.8rem;
-		color: #2e6653;
-		font-weight: 500;
-	}
-
-	.waypoint-list {
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
-	}
-
-	.waypoint-list button {
-		padding: 0.75rem;
-		border: 1px solid rgba(0, 0, 0, 0.08);
-		border-radius: 6px;
-		background: white;
-		text-align: left;
-		cursor: pointer;
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		transition: all 0.2s ease;
-	}
-
-	.waypoint-list button:not(:disabled):hover {
-		background: rgba(46, 102, 83, 0.05);
-		border-color: #2e6653;
-	}
-
-	.surface-bar {
-		display: flex;
-		height: 1.5rem;
-		border-radius: 6px;
-		overflow: hidden;
-		margin-bottom: 0.75rem;
-	}
-
-	.surface-segment {
-		flex: 1;
-		min-width: 4px;
-	}
-
-	.surface-list {
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
-	}
-
-	.surface-item {
-		display: flex;
-		align-items: center;
-		gap: 0.75rem;
-		font-size: 0.85rem;
-		padding: 0.5rem;
-	}
-
-	.dot {
-		width: 1rem;
-		height: 1rem;
-		border-radius: 3px;
-		flex-shrink: 0;
-	}
-
-	.analysis-note {
-		margin: 0.5rem 0;
-		font-size: 0.8rem;
-		color: #6b5d4f;
-		line-height: 1.4;
-	}
-</style>

@@ -16,7 +16,7 @@ export const MIN_TERRAIN_ZOOM = 6;
 export const MAX_TERRAIN_ZOOM = 22;
 export const DEFAULT_TERRAIN_MAX_ZOOM = 13;
 export const MIN_CONTOUR_ZOOM = 7;
-export const MIN_CONTOUR_LABEL_ZOOM = 6;
+export const MIN_CONTOUR_LABEL_ZOOM = 7;
 export const MIN_INTERMEDIATE_CONTOUR_ZOOM = 8;
 export const MIN_MINOR_CONTOUR_ZOOM = 9;
 
@@ -81,53 +81,51 @@ export const CONTOUR_LABEL_SPACING: unknown[] = [
 	['linear'],
 	['zoom'],
 	7,
-	1200,
+	900,
 	8,
-	1000,
+	760,
 	9,
-	850,
+	640,
 	10,
-	700,
+	520,
 	11,
-	580,
+	420,
 	12,
-	460,
-	13,
-	380,
-	14,
 	320,
+	13,
+	255,
+	14,
+	210,
 	15,
-	280,
+	175,
 	16,
-	240
+	145
 ];
 
 export const CONTOUR_LABEL_SIZE: unknown[] = [
 	'interpolate',
 	['linear'],
 	['zoom'],
-	6,
-	13,
 	7,
-	14,
-	8,
-	15,
 	9,
-	16,
+	8,
+	9.5,
+	9,
 	10,
-	17,
+	10,
+	10.25,
 	11,
-	18,
+	10.5,
 	12,
-	19,
+	11,
 	13,
-	20,
+	11.5,
 	14,
-	21,
+	12,
 	15,
-	22,
+	12.5,
 	16,
-	23
+	13
 ];
 
 /** Imperial mirror of {@link CONTOUR_THRESHOLDS}; rounded to readable intervals. */

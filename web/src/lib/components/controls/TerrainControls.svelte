@@ -55,7 +55,7 @@
 		onRotateMap
 	}: Props = $props();
 
-	const contourInterval = contourIntervalsAtZoom(mapZoom);
+	const contourInterval = $derived(contourIntervalsAtZoom(terrainContourUnit, mapZoom));
 </script>
 
 <div class="terrain-control-list">

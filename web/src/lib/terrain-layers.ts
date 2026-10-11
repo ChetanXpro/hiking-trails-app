@@ -805,15 +805,15 @@ function rebuildContourLayers(map: maplibregl.Map, runtime: TerrainRuntime) {
 				'text-rotation-alignment': 'map',
 				'text-keep-upright': true,
 				'text-allow-overlap': false,
-				'text-ignore-placement': false
+				'text-ignore-placement': false,
+				'text-offset': [0, -0.5]
 			},
 			paint: {
 				'text-color': PALETTE.contourLabel,
 				'text-halo-color': PALETTE.contourHalo,
 				'text-halo-width': 3.5,
 				'text-halo-blur': 0.8,
-				'text-opacity': ['interpolate', ['linear'], ['zoom'], 6, 1, 7, 1, 8, 0.95, 9, 0.92, 11, 0.88, 14, 0.90, 16, 0.92, 18, 0.85],
-				'text-offset': [0, -0.5]
+				'text-opacity': ['interpolate', ['linear'], ['zoom'], 6, 1, 7, 1, 8, 0.95, 9, 0.92, 11, 0.88, 14, 0.90, 16, 0.92, 18, 0.85]
 			}
 		},
 		runtime.labelAnchorId

@@ -21,7 +21,7 @@ export function queryFeaturesAtPoint(
 	if (!map) return [];
 
 	const features = map.querySourceFeatures('openmaptiles', {
-		sourceLayer: ['poi'],
+		sourceLayer: 'poi',
 		filter: ['in', ['get', 'type'], ['literal', ['peak', 'alpine_hut']]]
 	});
 

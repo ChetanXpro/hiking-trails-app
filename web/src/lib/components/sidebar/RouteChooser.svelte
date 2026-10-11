@@ -2,8 +2,8 @@
 	interface RouteChoice {
 		id: string;
 		name: string;
-		tag?: string;
-		network?: string;
+		tag: string | null;
+		network: string | null;
 	}
 
 	interface Props {

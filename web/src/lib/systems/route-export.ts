@@ -9,7 +9,7 @@ export function buildExportFilename(
 ): string {
 	if (!trail) return `trail.${format}`;
 
-	const name = trail.name
+	const name = (trail.name ?? 'trail')
 		.toLowerCase()
 		.replace(/\s+/g, '-')
 		.replace(/[^a-z0-9\-]/g, '')

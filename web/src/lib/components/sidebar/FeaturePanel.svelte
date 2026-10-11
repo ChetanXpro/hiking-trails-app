@@ -1,11 +1,12 @@
 <script lang="ts">
 	import type { MapFeatureSelection, WeatherForecast } from '../../types';
+	import { openStreetMapUrl } from '../../map-selection';
 	import WeatherSummary from '../../WeatherSummary.svelte';
 
 	interface Props {
 		selectedFeature: MapFeatureSelection | null;
 		weatherForecast: WeatherForecast | null;
-		weatherStatus: 'loading' | 'ready' | 'error';
+		weatherStatus: 'idle' | 'loading' | 'ready' | 'error';
 		weatherError: string | null;
 		nearbyFeatures?: any[];
 		nearbyTrails?: any[];
@@ -15,13 +16,13 @@
 		onSelectNearby?: (feature: any) => void;
 		onLoadTrail?: (id: string) => void;
 		onRefreshWeather?: (coordinates?: any) => void;
-		coordinateCopyStatus?: 'default' | 'copied' | 'error';
+		coordinateCopyStatus?: 'idle' | 'copied' | 'error';
 	}
 
 	let {
 		selectedFeature = null,
 		weatherForecast = null,
-		weatherStatus = 'loading',
+		weatherStatus = 'idle',
 		weatherError = null,
 		nearbyFeatures = [],
 		nearbyTrails = [],
@@ -31,7 +32,7 @@
 		onSelectNearby,
 		onLoadTrail,
 		onRefreshWeather,
-		coordinateCopyStatus = 'default'
+		coordinateCopyStatus = 'idle'
 	}: Props = $props();
 </script>
 
@@ -76,7 +77,7 @@
 						? 'Copy failed'
 						: 'Copy coordinates'}
 			</button>
-			<a href="https://www.openstreetmap.org" target="_blank" rel="noreferrer">
+			<a href={openStreetMapUrl(selectedFeature)} target="_blank" rel="noreferrer">
 				<span>↗</span>Open in OSM
 			</a>
 		</div>
@@ -134,26 +135,3 @@
 		{/if}
 	{/if}
 </aside>
-
-<style>
-	:global(.feature-panel) {
-		position: absolute;
-		right: 0;
-		top: 0;
-		bottom: 0;
-		z-index: 10;
-		width: min(460px, 100vw);
-		background: rgba(250, 247, 238, 0.96);
-		border-left: 1px solid rgba(0, 0, 0, 0.08);
-		overflow: auto;
-		padding: 1rem;
-		display: flex;
-		flex-direction: column;
-		transform: translateX(100%);
-		transition: transform 200ms ease;
-	}
-
-	:global(.feature-panel:not([hidden])) {
-		transform: translateX(0);
-	}
-</style>

@@ -35,7 +35,7 @@ export function findFirstLabelAnchor(
 	layersBefore?: string[]
 ): string | undefined {
 	if (!style.layers) return undefined;
-	const textLayers = style.layers.filter((l) => l.type === 'symbol' && 'text-field' in l.paint);
+	const textLayers = style.layers.filter((l) => l.type === 'symbol' && l.layout && 'text-field' in l.layout);
 	if (layersBefore?.length) {
 		return textLayers.find((l) => layersBefore.includes(l.id))?.id;
 	}
